@@ -8,8 +8,8 @@ use tokio::time::timeout;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Chunk {
-    chunk_limits: std::ops::RangeInclusive<u64>,
-    progress: AtomicU64
+    pub chunk_limits: std::ops::RangeInclusive<u64>,
+    pub progress: AtomicU64
 }
 
 // An owned handle since we will need a mutex if we had to use Arc
