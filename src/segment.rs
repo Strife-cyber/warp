@@ -1,7 +1,11 @@
 use std::sync::Arc;
 use futures_util::stream::StreamExt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::time::timeout;
+
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Chunk {
     chunk_limits: std::ops::RangeInclusive<u64>,
@@ -14,28 +18,42 @@ pub async fn download_worker(
     client: Arc<reqwest::Client>,
     mut handle: tokio::fs::File,
     chunk: Arc<Chunk>,
-    url: String
+    url: &str
 ) -> Result<(), anyhow::Error> {
-    let start_offset = chunk.chunk_limits.start() + chunk.progress.load(Ordering::SeqCst);
-    handle.seek(SeekFrom::Start(start_offset)).await?;
+    // 1. The Persistence Layer: Try the whole operation up to 3 times
+    for _ in 0..3 {
+        // 2. Refresh state: Get the latest progress to set the Range header
+        let start_offset = chunk.chunk_limits.start() + chunk.progress.load(Ordering::SeqCst);
 
-    let response = client
-        .get(url)
-        .header("Range", format!("bytes={}-{}", start_offset, chunk.chunk_limits.end()))
-        .send()
-        .await?;
+        // 3. Set the handle to the current offset to avoid reseeking
+        handle.seek(SeekFrom::Start(start_offset)).await?;
 
-    let mut stream = response.bytes_stream();
+        //4. The Connection: Wrap the 'send()' in a 30s timeout
+        let response = match timeout(TIMEOUT, client
+            .get(url)
+            .header("Range", format!("bytes={}-{}", start_offset, chunk.chunk_limits.end()))
+            .send()).await {
+            Ok(res) => res?,
+            Err(_) => continue // Timeout! Jump to the next iteration
+        };
 
-    while let Some(packet_result) = stream.next().await {
-        match packet_result {
-            Ok(packet) => {
-                handle.write_all(&packet).await?;
-                chunk.progress.fetch_add(packet.len() as u64, Ordering::SeqCst);
-            }
-            Err(_) => {}
+        // 5. Collect the byte stream from the response into a stream
+        let mut stream = response.bytes_stream();
+
+        // 6. The Streaming Layer: Process packets
+        while let Ok(Some(item_result)) = timeout(TIMEOUT, stream.next()).await {
+            let packet = item_result?;
+            handle.write_all(&packet).await?;
+            chunk.progress.fetch_add(packet.len() as u64, Ordering::SeqCst);
         }
+
+        // 7. The checkout layer just in case we timed out
+        if chunk.progress.load(Ordering::SeqCst) != *chunk.chunk_limits.end() {
+            continue;
+        }
+
+        return Ok(());
     }
 
-    Ok(())
+    Err(anyhow::anyhow!("Worker failed to complete chunk after 3 attempts"))
 }
