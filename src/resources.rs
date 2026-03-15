@@ -1,12 +1,23 @@
 use std::thread;
 use sysinfo::{System};
 
-
+/// Represents system resource statistics and recommended settings.
 pub struct ResourceStats {
+    /// The calculated number of concurrent workers suggested for optimal performance.
     pub suggested_workers: usize,
+    /// The current global CPU usage percentage (0.0 to 100.0).
     pub cpu_usage: f32,
 }
 
+/// Calculates the optimal number of workers based on current system resource availability.
+///
+/// This function assesses total logical CPU cores and global CPU usage to determine
+/// a "multiplier" strategy:
+/// - **Idle system (<40%):** 4x workers per core for maximum throughput.
+/// - **Moderate load (40-70%):** 2x workers per core.
+/// - **Heavy load (>70%):** 1 worker per core to maintain system stability.
+///
+/// Returns a [`ResourceStats`] struct containing the recommendation and current metrics.
 pub fn calculate_optimal_workers() -> ResourceStats {
     let mut sys = System::new_all();
     sys.refresh_cpu_all();

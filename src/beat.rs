@@ -4,37 +4,51 @@ use std::time::Duration;
 use crate::segment::Chunk;
 use crate::manager::Metadata;
 use tokio_util::sync::CancellationToken;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{Ordering};
 
-// This is what actually gets turned into binary and saved to the .warp file
+/// A serializable snapshot of a single chunk's progress.
+/// Used to save and resume downloads from a `.warp` file.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ChunkSnapshot {
+    /// Start byte of the range.
     pub start: u64,
+    /// End byte of the range (inclusive).
     pub end: u64,
-    pub progress: u64, // Just a plain number now!
+    /// Number of bytes downloaded within this range.
+    pub progress: u64,
 }
 
+/// A serializable snapshot of the entire download state.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct MetadataSnapshot {
+    /// Source URL.
     pub url: String,
+    /// Total expected file size.
     pub size: u64,
+    /// List of all chunk snapshots.
     pub chunks: Vec<ChunkSnapshot>,
 }
 
-
-pub async fn start_heartbeat(metadata: Arc<Metadata>, token: CancellationToken, target_path: &Path) -> Result<(), anyhow::Error> {
+/// Periodically saves the download state to a persistence file.
+///
+/// The heartbeat ensures that if the process crashes, the download can be resumed
+/// from the last saved state with minimal data loss.
+pub async fn start_heartbeat_sync(
+    metadata: Arc<Metadata>,
+    token: CancellationToken,
+    target_path: &Path
+) -> Result<(), anyhow::Error> {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
 
     loop {
         tokio::select! {
-            // Option A: The timer goes off
+            // Periodic snapshot every second
             _ = interval.tick() => {
-                save_snapshot(&metadata, target_path).await?;
+                save_snapshot_sync(&metadata, target_path).await?;
             },
-            // Option B: The Manager flips the switch
+            // Final snapshot upon manager cancellation/completion
             _ = token.cancelled() => {
-                // Perform one final save before exiting!
-                save_snapshot(&metadata, target_path).await?;
+                save_snapshot_sync(&metadata, target_path).await?;
                 break;
             }
         }
@@ -43,33 +57,42 @@ pub async fn start_heartbeat(metadata: Arc<Metadata>, token: CancellationToken, 
     Ok(())
 }
 
+/// Loads a previous download state from a `.warp` file.
+///
+/// This is the entry point for resuming a download. It reconstructs the
+/// [`Metadata`] structure, including the thread-safe chunk queue, from the disk snapshot.
 pub async fn load_snapshot(target_path: &Path) -> Result<Metadata, anyhow::Error> {
     let snapshot = load_warp_file(target_path).await?;
 
-    let chunks = snapshot.chunks.into_iter().map(|c| {
-        Arc::new(Chunk {
-            chunk_limits: c.start..=c.end,
-            progress: AtomicU64::new(c.progress)
-        })
-    }).collect();
+    let mut chunks = std::collections::VecDeque::new();
+    for c in snapshot.chunks {
+        // Reconstruct each chunk with its previously saved progress
+        chunks.push_back(Arc::new(Chunk::new(c.start..=c.end, c.progress)));
+    }
 
     Ok(Metadata {
         url: snapshot.url,
         size: snapshot.size,
-        chunks,
+        chunks: tokio::sync::Mutex::new(chunks),
     })
 }
 
+/// Reads and deserializes the `.warp` file from disk.
 async fn load_warp_file(target_path: &Path) -> Result<MetadataSnapshot, anyhow::Error> {
     let bytes = tokio::fs::read(target_path).await?;
     Ok(bincode::deserialize(&bytes)?)
 }
 
-async fn save_snapshot(metadata: &Metadata, target_path: &Path) -> Result<(), anyhow::Error> {
-    let snapshot = create_snapshot(&metadata);
+/// Atomically saves the current metadata state to a file.
+///
+/// To prevent file corruption during a crash, this function:
+/// 1.  Serializes the state to a memory buffer.
+/// 2.  Writes the buffer to a temporary file (`.warp.tmp`).
+/// 3.  Atomically renames the temporary file to the final destination.
+async fn save_snapshot_sync(metadata: &Metadata, target_path: &Path) -> Result<(), anyhow::Error> {
+    let snapshot = create_snapshot_sync(metadata).await;
     let bytes = bincode::serialize(&snapshot)?;
 
-    // 1. Create a temporary path
     let mut tmp_path = target_path.to_path_buf();
     let file_name = target_path.file_name()
         .and_then(|n| n.to_str())
@@ -77,28 +100,30 @@ async fn save_snapshot(metadata: &Metadata, target_path: &Path) -> Result<(), an
     let tmp_file_name = format!("{}.warp.tmp", file_name);
     tmp_path.set_file_name(tmp_file_name);
 
-    // 2. Write the data to the temporary file
     tokio::fs::write(&tmp_path, &bytes).await?;
-
-    // 3. Atomically rename the temp file to the target file
-    // On most OSs, this "overwrites" the target path in one step
     tokio::fs::rename(&tmp_path, target_path).await?;
 
     Ok(())
 }
 
-fn create_snapshot(metadata: &Metadata) -> MetadataSnapshot {
+/// Captures a point-in-time snapshot of all chunks from the live Metadata.
+async fn create_snapshot_sync(metadata: &Metadata) -> MetadataSnapshot {
+    let chunks_guard = metadata.chunks.lock().await;
+    let mut chunks = Vec::new();
+    
+    for chunk_arc in chunks_guard.iter() {
+        // We must lock each chunk's limits as they might be changing during a split
+        let limits = chunk_arc.chunk_limits.lock().await;
+        chunks.push(ChunkSnapshot {
+            start: *limits.start(),
+            end: *limits.end(),
+            progress: chunk_arc.progress.load(Ordering::Relaxed),
+        });
+    }
+
     MetadataSnapshot {
         url: metadata.url.clone(),
         size: metadata.size,
-        chunks: metadata.chunks.iter().map(|chunk_arc| {
-            ChunkSnapshot {
-                start: *chunk_arc.chunk_limits.start(),
-                end: *chunk_arc.chunk_limits.end(),
-                // This is the most important part: capturing the current number
-                progress: chunk_arc.progress.load(Ordering::Relaxed),
-            }
-        }).collect()
+        chunks,
     }
 }
-
