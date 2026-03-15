@@ -77,6 +77,7 @@ pub async fn load_snapshot(target_path: &Path) -> Result<Metadata, anyhow::Error
         size: snapshot.size,
         chunks: tokio::sync::Mutex::new(chunks),
         active_chunks: tokio::sync::Mutex::new(Vec::new()),
+        completed_chunks: tokio::sync::Mutex::new(Vec::new()),
     })
 }
 
@@ -110,7 +111,7 @@ pub async fn save_snapshot_sync(metadata: &Metadata, target_path: &Path) -> Resu
     Ok(())
 }
 
-/// Captures a point-in-time snapshot of all chunks (waiting and active) from the live Metadata.
+/// Captures a point-in-time snapshot of all chunks (waiting, active, and completed) from the live Metadata.
 async fn create_snapshot_sync(metadata: &Metadata) -> MetadataSnapshot {
     let mut chunks = Vec::new();
     
@@ -131,6 +132,19 @@ async fn create_snapshot_sync(metadata: &Metadata) -> MetadataSnapshot {
     {
         let active_guard = metadata.active_chunks.lock().await;
         for chunk_arc in active_guard.iter() {
+            let limits = chunk_arc.chunk_limits.lock().await;
+            chunks.push(ChunkSnapshot {
+                start: *limits.start(),
+                end: *limits.end(),
+                progress: chunk_arc.progress.load(Ordering::Relaxed),
+            });
+        }
+    }
+
+    // 3. Capture completed chunks
+    {
+        let completed_guard = metadata.completed_chunks.lock().await;
+        for chunk_arc in completed_guard.iter() {
             let limits = chunk_arc.chunk_limits.lock().await;
             chunks.push(ChunkSnapshot {
                 start: *limits.start(),

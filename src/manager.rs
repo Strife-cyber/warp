@@ -15,6 +15,8 @@ pub struct Metadata {
     pub chunks: Mutex<VecDeque<Arc<Chunk>>>,
     /// A list of chunks that are CURRENTLY being processed by workers.
     pub active_chunks: Mutex<Vec<Arc<Chunk>>>,
+    /// A list of chunks that have COMPLETELY finished downloading.
+    pub completed_chunks: Mutex<Vec<Arc<Chunk>>>,
 }
 
 impl Metadata {
@@ -28,10 +30,11 @@ impl Metadata {
             size,
             chunks: Mutex::new(chunks),
             active_chunks: Mutex::new(Vec::new()),
+            completed_chunks: Mutex::new(Vec::new()),
         }
     }
 
-    /// Calculates the total bytes downloaded across both waiting and active chunks.
+    /// Calculates the total bytes downloaded across waiting, active, and completed chunks.
     pub async fn total_progress(&self) -> u64 {
         let mut total = 0;
 
@@ -42,9 +45,16 @@ impl Metadata {
         }
         drop(queue);
 
-        // Count progress from active chunks (the most important part)
+        // Count progress from active chunks (currently being downloaded)
         let active = self.active_chunks.lock().await;
         for c in active.iter() {
+            total += c.progress.load(Ordering::Relaxed);
+        }
+        drop(active);
+
+        // Count progress from completed chunks
+        let completed = self.completed_chunks.lock().await;
+        for c in completed.iter() {
             total += c.progress.load(Ordering::Relaxed);
         }
 
@@ -65,9 +75,24 @@ pub struct Manager {
 }
 
 impl Manager {
+    /// Fetches the Content-Length of a remote resource using a HEAD request.
+    async fn fetch_content_length(client: &reqwest::Client, url: &str) -> Result<u64, anyhow::Error> {
+        let response = client.head(url).send().await?;
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!("Failed to fetch content length for {}: Status {}", url, response.status()));
+        }
+        let size = response.headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|val| val.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| anyhow::anyhow!("Content-Length header missing or invalid for {}", url))?;
+        Ok(size)
+    }
+
     /// Initializes a Manager, automatically attempting to resume from a .warp file if it exists.
     pub async fn from_url(url: String, target_path: std::path::PathBuf) -> Result<Self, anyhow::Error> {
         let warp_path = target_path.with_extension("warp");
+        let client = Arc::new(reqwest::Client::new());
 
         let metadata = if warp_path.exists() {
             println!("Found .warp file, attempting to resume {}...", target_path.display());
@@ -75,21 +100,23 @@ impl Manager {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("Failed to load snapshot for {}: {}. Starting fresh.", target_path.display(), e);
-                    Metadata::new(url, 1024 * 1024 * 100) 
+                    let size = Self::fetch_content_length(&client, &url).await?;
+                    Metadata::new(url, size) 
                 }
             }
         } else {
             println!("No .warp file found for {}, starting fresh download.", target_path.display());
-            Metadata::new(url, 1024 * 1024 * 100) 
+            let size = Self::fetch_content_length(&client, &url).await?;
+            Metadata::new(url, size) 
         };
 
-        Ok(Self::new(metadata, target_path))
+        Ok(Self::new(metadata, target_path, client))
     }
 
-    pub fn new(metadata: Metadata, target_path: std::path::PathBuf) -> Self {
+    pub fn new(metadata: Metadata, target_path: std::path::PathBuf, client: Arc<reqwest::Client>) -> Self {
         Self {
             metadata: Arc::new(metadata),
-            client: Arc::new(reqwest::Client::new()),
+            client,
             cancel_token: tokio_util::sync::CancellationToken::new(),
             target_path,
         }
@@ -144,14 +171,15 @@ impl Manager {
             // Cleanup phase
             while let Some(front) = queue.front() {
                 if front.remaining_bytes().await == 0 {
-                    queue.pop_front();
+                    let chunk = queue.pop_front().unwrap();
+                    self.metadata.completed_chunks.lock().await.push(chunk);
                 } else {
                     break;
                 }
             }
 
             if queue.is_empty() {
-                if let Some(new_chunk) = self.try_steal_work(&mut queue).await {
+                if let Some(new_chunk) = self.try_steal_work().await {
                     queue.push_back(new_chunk);
                 } else if workers.is_empty() {
                     break; 
@@ -174,9 +202,16 @@ impl Manager {
                     let _permit = permit;
                     let res = download_worker(client, path, chunk, url, token).await;
 
-                    // Remove from active once done
+                    // Transition chunk based on result
                     let mut active = meta.active_chunks.lock().await;
-                    active.retain(|c| !Arc::ptr_eq(c, &chunk_clone));
+                    if let Some(pos) = active.iter().position(|c| Arc::ptr_eq(c, &chunk_clone)) {
+                        let c = active.remove(pos);
+                        if res.is_ok() {
+                            meta.completed_chunks.lock().await.push(c);
+                        } else {
+                            meta.chunks.lock().await.push_back(c);
+                        }
+                    }
 
                     res
                 });
@@ -234,8 +269,27 @@ impl Manager {
         }
     }
 
-    async fn try_steal_work(&self, _queue: &mut VecDeque<Arc<Chunk>>) -> Option<Arc<Chunk>> {
-        None
+    /// Attempts to steal work from one of the currently active worker chunks by splitting it.
+    async fn try_steal_work(&self) -> Option<Arc<Chunk>> {
+        let active = self.metadata.active_chunks.lock().await;
+        
+        // Find the active chunk with the most remaining bytes to split.
+        let mut best_target: Option<Arc<Chunk>> = None;
+        let mut max_remaining = 0;
+
+        for chunk in active.iter() {
+            let rem = chunk.remaining_bytes().await;
+            if rem > max_remaining {
+                max_remaining = rem;
+                best_target = Some(Arc::clone(chunk));
+            }
+        }
+
+        if let Some(target) = best_target {
+            target.split().await
+        } else {
+            None
+        }
     }
 }
 
@@ -244,7 +298,6 @@ use tokio::time::Duration;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -273,6 +326,75 @@ mod tests {
 
         let manager = Manager::from_url("http://test.com".to_string(), target_path).await.unwrap();
         assert_eq!(manager.metadata.total_progress().await, 2500);
+    }
+
+    #[tokio::test]
+    async fn test_total_progress_with_completed_chunks() {
+        let size = 1000;
+        let metadata = Metadata::new("url".to_string(), size);
+        
+        // 1. Initial progress is 0
+        assert_eq!(metadata.total_progress().await, 0);
+
+        // 2. Add progress to a waiting chunk
+        {
+            let queue = metadata.chunks.lock().await;
+            queue[0].progress.store(100, Ordering::SeqCst);
+        }
+        assert_eq!(metadata.total_progress().await, 100);
+
+        // 3. Move chunk to active
+        let chunk = {
+            let mut queue = metadata.chunks.lock().await;
+            queue.pop_front().unwrap()
+        };
+        metadata.active_chunks.lock().await.push(Arc::clone(&chunk));
+        assert_eq!(metadata.total_progress().await, 100);
+
+        // 4. Move chunk to completed
+        {
+            let mut active = metadata.active_chunks.lock().await;
+            active.pop();
+        }
+        metadata.completed_chunks.lock().await.push(chunk);
+        
+        // Progress should STILL be 100
+        assert_eq!(metadata.total_progress().await, 100);
+    }
+
+    #[tokio::test]
+    async fn test_worker_failure_requeue() {
+        let dir = tempdir().unwrap();
+        let target_path = dir.path().join("test.bin");
+        let metadata = Metadata::new("url".to_string(), 1000);
+        let manager = Manager::new(metadata, target_path, Arc::new(reqwest::Client::new()));
+        
+        let chunk = {
+            let mut queue = manager.metadata.chunks.lock().await;
+            queue.pop_front().unwrap()
+        };
+        let chunk_clone = Arc::clone(&chunk);
+        
+        // Simulate worker starting
+        manager.metadata.active_chunks.lock().await.push(Arc::clone(&chunk));
+        
+        // Simulate worker failing
+        {
+            let mut active = manager.metadata.active_chunks.lock().await;
+            let pos = active.iter().position(|c| Arc::ptr_eq(c, &chunk_clone)).unwrap();
+            let c = active.remove(pos);
+            // Re-queue
+            manager.metadata.chunks.lock().await.push_back(c);
+        }
+        
+        // Verify it's back in the queue
+        let queue = manager.metadata.chunks.lock().await;
+        assert_eq!(queue.len(), 1);
+        assert!(Arc::ptr_eq(&queue[0], &chunk_clone));
+        
+        // Verify active is empty
+        let active = manager.metadata.active_chunks.lock().await;
+        assert!(active.is_empty());
     }
 }
 

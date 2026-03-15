@@ -36,7 +36,7 @@ pub enum Commands {
     },
 }
 
-pub fn handle_add(url: String, output: Option<PathBuf>, registry: &mut Registry) -> Result<()> {
+pub async fn handle_add(url: String, output: Option<PathBuf>, registry: &mut Registry) -> Result<()> {
     let target_path = match output {
         Some(p) => p,
         None => {
@@ -45,6 +45,15 @@ pub fn handle_add(url: String, output: Option<PathBuf>, registry: &mut Registry)
             PathBuf::from(filename)
         }
     };
+
+    // Verify URL and get content length immediately
+    println!("Verifying URL: {}...", url);
+    let client = reqwest::Client::new();
+    let response = client.head(&url).send().await?;
+    
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!("URL verification failed: Status {}", response.status()));
+    }
 
     let id = registry.add(url.clone(), target_path.clone());
     registry.save()?;
@@ -141,22 +150,24 @@ pub async fn handle_inspect(id: String, registry: &Registry) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_handle_add_derives_filename() {
+    #[tokio::test]
+    #[ignore] // Requires internet access
+    async fn test_handle_add_derives_filename() {
         let mut registry = Registry::default();
         let url = "http://example.com/somefile.txt?query=1".to_string();
-        handle_add(url.clone(), None, &mut registry).ok();
+        handle_add(url.clone(), None, &mut registry).await.ok();
         
         let entry = registry.downloads.values().next().unwrap();
         assert_eq!(entry.url, url);
         assert_eq!(entry.target_path.to_str().unwrap(), "somefile.txt");
     }
 
-    #[test]
-    fn test_handle_add_explicit_path() {
+    #[tokio::test]
+    #[ignore] // Requires internet access
+    async fn test_handle_add_explicit_path() {
         let mut registry = Registry::default();
         let path = PathBuf::from("explicit.bin");
-        handle_add("url".to_string(), Some(path.clone()), &mut registry).ok();
+        handle_add("http://example.com".to_string(), Some(path.clone()), &mut registry).await.ok();
         
         let entry = registry.downloads.values().next().unwrap();
         assert_eq!(entry.target_path, path);

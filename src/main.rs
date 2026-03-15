@@ -25,7 +25,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     match cli.command {
         Commands::Add { url, output } => {
-            cli::handle_add(url, output, &mut registry)?;
+            cli::handle_add(url, output, &mut registry).await?;
         }
         Commands::List => {
             cli::handle_list(&registry);
