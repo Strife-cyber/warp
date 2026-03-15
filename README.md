@@ -60,16 +60,20 @@ warp remove <ID>
 
 ## 🔧 Installation
 
+### Local Build
 1. Ensure you have the [Rust toolchain](https://rustup.rs/) installed.
-2. Clone the repository:
-   ```bash
-   git clone https://github.com/Strife-Cyber/warp.git
-   cd warp
-   ```
-3. Build the project:
+2. Clone the repository and build:
    ```bash
    cargo build --release
    ```
+
+### Global Installation (Add to PATH)
+To use `warp` from anywhere in your terminal, install it locally:
+```bash
+cargo install --path .
+```
+*This places the binary in your `.cargo/bin` directory, which is typically already in your system PATH.*
+
 
 ---
 
