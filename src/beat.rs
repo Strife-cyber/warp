@@ -76,11 +76,12 @@ pub async fn load_snapshot(target_path: &Path) -> Result<Metadata, anyhow::Error
         url: snapshot.url,
         size: snapshot.size,
         chunks: tokio::sync::Mutex::new(chunks),
+        active_chunks: tokio::sync::Mutex::new(Vec::new()),
     })
 }
 
 /// Reads and deserializes the `.warp` file from disk.
-async fn load_warp_file(target_path: &Path) -> Result<MetadataSnapshot, anyhow::Error> {
+pub async fn load_warp_file(target_path: &Path) -> Result<MetadataSnapshot, anyhow::Error> {
     let bytes = tokio::fs::read(target_path).await
         .map_err(|e| anyhow::anyhow!("Failed to read .warp file {}: {}", target_path.display(), e))?;
     Ok(bincode::deserialize(&bytes)?)
@@ -109,19 +110,34 @@ pub async fn save_snapshot_sync(metadata: &Metadata, target_path: &Path) -> Resu
     Ok(())
 }
 
-/// Captures a point-in-time snapshot of all chunks from the live Metadata.
+/// Captures a point-in-time snapshot of all chunks (waiting and active) from the live Metadata.
 async fn create_snapshot_sync(metadata: &Metadata) -> MetadataSnapshot {
-    let chunks_guard = metadata.chunks.lock().await;
     let mut chunks = Vec::new();
     
-    for chunk_arc in chunks_guard.iter() {
-        // We must lock each chunk's limits as they might be changing during a split
-        let limits = chunk_arc.chunk_limits.lock().await;
-        chunks.push(ChunkSnapshot {
-            start: *limits.start(),
-            end: *limits.end(),
-            progress: chunk_arc.progress.load(Ordering::Relaxed),
-        });
+    // 1. Capture waiting chunks
+    {
+        let chunks_guard = metadata.chunks.lock().await;
+        for chunk_arc in chunks_guard.iter() {
+            let limits = chunk_arc.chunk_limits.lock().await;
+            chunks.push(ChunkSnapshot {
+                start: *limits.start(),
+                end: *limits.end(),
+                progress: chunk_arc.progress.load(Ordering::Relaxed),
+            });
+        }
+    }
+
+    // 2. Capture active chunks (currently with workers)
+    {
+        let active_guard = metadata.active_chunks.lock().await;
+        for chunk_arc in active_guard.iter() {
+            let limits = chunk_arc.chunk_limits.lock().await;
+            chunks.push(ChunkSnapshot {
+                start: *limits.start(),
+                end: *limits.end(),
+                progress: chunk_arc.progress.load(Ordering::Relaxed),
+            });
+        }
     }
 
     MetadataSnapshot {

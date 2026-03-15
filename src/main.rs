@@ -36,6 +36,9 @@ async fn main() -> Result<(), anyhow::Error> {
         Commands::Run => {
             engine::run_all(&mut registry).await?;
         }
+        Commands::Inspect { id } => {
+            cli::handle_inspect(id, &registry).await?;
+        }
     }
 
     Ok(())
