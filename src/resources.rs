@@ -47,3 +47,22 @@ pub fn calculate_optimal_workers() -> ResourceStats {
         cpu_usage: global_cpu_usage,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_optimal_workers() {
+        // Goal: Ensure the worker calculation returns sane values across different system loads.
+        
+        let stats = calculate_optimal_workers();
+        
+        // Verify that we always have at least one worker and don't exceed our safety cap.
+        assert!(stats.suggested_workers >= 1, "Suggested workers should never be less than 1");
+        assert!(stats.suggested_workers <= 32, "Suggested workers should not exceed the safety cap of 32");
+        
+        // Verify that CPU usage is within the valid percentage range.
+        assert!(stats.cpu_usage >= 0.0 && stats.cpu_usage <= 100.0, "CPU usage must be between 0 and 100%");
+    }
+}

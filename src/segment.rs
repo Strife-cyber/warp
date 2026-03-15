@@ -202,3 +202,101 @@ async fn perform_download(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_chunk_initialization() {
+        // Goal: Ensure a Chunk is correctly initialized with the provided range and progress.
+        let chunk = Chunk::new(0..=99, 10);
+        
+        // Verify initial progress is stored correctly.
+        assert_eq!(chunk.progress.load(Ordering::SeqCst), 10);
+        
+        // Verify the byte range limits are set accurately.
+        let limits = chunk.chunk_limits.lock().await;
+        assert_eq!(*limits.start(), 0);
+        assert_eq!(*limits.end(), 99);
+    }
+
+    #[tokio::test]
+    async fn test_remaining_bytes() {
+        // Goal: Verify the dynamic calculation of remaining bytes based on progress and range.
+        let chunk = Chunk::new(0..=99, 0);
+        
+        // Case 1: Fresh chunk (0 progress) should have full range remaining.
+        assert_eq!(chunk.remaining_bytes().await, 100);
+
+        // Case 2: Partial progress.
+        chunk.progress.store(50, Ordering::SeqCst);
+        assert_eq!(chunk.remaining_bytes().await, 50);
+
+        // Case 3: Fully completed chunk.
+        chunk.progress.store(100, Ordering::SeqCst);
+        assert_eq!(chunk.remaining_bytes().await, 0);
+
+        // Case 4: Progress exceeding range (should be clamped to 0 remaining).
+        chunk.progress.store(150, Ordering::SeqCst);
+        assert_eq!(chunk.remaining_bytes().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_chunk_split_too_small() {
+        // Goal: Ensure chunks below the MIN_SPLIT_SIZE threshold are NOT split.
+        // Range is 1MB, which is significantly less than the 20MB required for a split.
+        let chunk = Arc::new(Chunk::new(0..=(1024 * 1024 - 1), 0));
+        let new_chunk = chunk.split().await;
+        
+        assert!(new_chunk.is_none(), "Chunk should not split if below size threshold");
+    }
+
+    #[tokio::test]
+    async fn test_chunk_split_success() {
+        // Goal: Verify a successful split of a large chunk into two halves.
+        // Range is 30MB (sufficient for a split).
+        let total_size = 30 * 1024 * 1024;
+        let chunk = Arc::new(Chunk::new(0..=(total_size - 1), 0));
+        
+        let new_chunk = chunk.split().await.expect("Should split 30MB chunk");
+        
+        let original_limits = chunk.chunk_limits.lock().await;
+        let new_limits = new_chunk.chunk_limits.lock().await;
+
+        // The split point should be at exactly 15MB (midpoint).
+        let expected_split_point = 15 * 1024 * 1024;
+        
+        // Original chunk should now cover the first 15MB.
+        assert_eq!(*original_limits.start(), 0);
+        assert_eq!(*original_limits.end(), (expected_split_point - 1) as u64);
+        
+        // New chunk should cover the remaining 15MB.
+        assert_eq!(*new_limits.start(), expected_split_point as u64);
+        assert_eq!(*new_limits.end(), (total_size - 1) as u64);
+        
+        // New chunk must start with 0 progress.
+        assert_eq!(new_chunk.progress.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_chunk_split_with_progress() {
+        // Goal: Verify that a split correctly accounts for current progress.
+        // Range 0..=30MB, but 10MB already downloaded. 20MB remaining.
+        let total_size = 30 * 1024 * 1024;
+        let progress = 10 * 1024 * 1024;
+        let chunk = Arc::new(Chunk::new(0..=(total_size - 1), progress));
+
+        let new_chunk = chunk.split().await.expect("Should split chunk with remaining 20MB");
+        
+        let original_limits = chunk.chunk_limits.lock().await;
+        let new_limits = new_chunk.chunk_limits.lock().await;
+
+        // The split should happen in the MIDDLE of the REMAINING 20MB.
+        // Split point = progress (10MB) + half-remaining (10MB) = 20MB.
+        let expected_split_point = 20 * 1024 * 1024;
+
+        assert_eq!(*original_limits.end(), (expected_split_point - 1) as u64);
+        assert_eq!(*new_limits.start(), expected_split_point as u64);
+    }
+}

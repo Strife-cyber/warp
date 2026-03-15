@@ -233,3 +233,67 @@ impl Manager {
 }
 
 use tokio::time::Duration;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn test_metadata_new() {
+        // Goal: Ensure fresh Metadata is created with a single chunk covering the entire range.
+        let url = "http://example.com".to_string();
+        let size = 1000;
+        let metadata = Metadata::new(url.clone(), size);
+        
+        // Verify core properties.
+        assert_eq!(metadata.url, url);
+        assert_eq!(metadata.size, size);
+        
+        // Verify the initial chunk structure.
+        let chunks = metadata.chunks.lock().await;
+        assert_eq!(chunks.len(), 1, "Metadata should start with exactly one chunk");
+        
+        let chunk_limits = chunks[0].chunk_limits.lock().await;
+        assert_eq!(*chunk_limits.start(), 0);
+        assert_eq!(*chunk_limits.end(), 999);
+    }
+
+    #[tokio::test]
+    async fn test_manager_new() {
+        // Goal: Ensure the Manager is correctly initialized with provided metadata and path.
+        let url = "http://example.com".to_string();
+        let metadata = Metadata::new(url, 1000);
+        let target_path = PathBuf::from("test.mp4");
+        let manager = Manager::new(metadata, target_path.clone());
+        
+        // Verify state initialization.
+        assert_eq!(manager.target_path, target_path);
+        assert!(!manager.cancel_token.is_cancelled(), "Manager should start in an active state");
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_chunks() {
+        // Goal: Verify that the Manager can automatically split an initial large chunk 
+        // to match a target worker count (Resource Reconciliation).
+        
+        // Create 100MB metadata (starts as 1 chunk).
+        let metadata = Metadata::new("url".to_string(), 100 * 1024 * 1024);
+        let manager = Manager::new(metadata, PathBuf::from("test"));
+
+        // Scenario: We have 4 available worker slots. 
+        // reconcile_chunks should split the single 100MB chunk until at least 4 chunks exist.
+        manager.reconcile_chunks(4).await;
+
+        let chunks = manager.metadata.chunks.lock().await;
+        assert!(chunks.len() >= 4, "Reconciliation should have increased chunk count to at least 4");
+        
+        // Ensure no data loss: total size of all chunks should still be 100MB.
+        let mut total_range_sum = 0;
+        for c in chunks.iter() {
+            let limits = c.chunk_limits.lock().await;
+            total_range_sum += (*limits.end() - *limits.start()) + 1;
+        }
+        assert_eq!(total_range_sum, 100 * 1024 * 1024);
+    }
+}

@@ -127,3 +127,43 @@ async fn create_snapshot_sync(metadata: &Metadata) -> MetadataSnapshot {
         chunks,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_snapshot_serialization_deserialization() {
+        // Goal: Verify the full lifecycle of a persistence snapshot (save -> load).
+        
+        let dir = tempdir().unwrap();
+        let warp_path = dir.path().join("test.warp");
+
+        // 1. Create initial metadata and simulate some progress.
+        let metadata = Metadata::new("http://test.com".to_string(), 1000);
+        {
+            let chunks = metadata.chunks.lock().await;
+            chunks[0].progress.store(500, Ordering::SeqCst);
+        }
+
+        // 2. Save the state to a temporary .warp file.
+        save_snapshot_sync(&metadata, &warp_path).await.unwrap();
+        assert!(warp_path.exists(), "Snapshot file should be created on disk");
+
+        // 3. Load the state back from the file.
+        let loaded_metadata = load_snapshot(&warp_path).await.expect("Failed to load snapshot from disk");
+        
+        // 4. Verify the loaded state matches the original simulated state.
+        assert_eq!(loaded_metadata.url, "http://test.com");
+        assert_eq!(loaded_metadata.size, 1000);
+
+        let chunks = loaded_metadata.chunks.lock().await;
+        assert_eq!(chunks.len(), 1, "Should have loaded exactly one chunk");
+        assert_eq!(chunks[0].progress.load(Ordering::SeqCst), 500, "Loaded progress should match saved progress");
+        
+        let limits = chunks[0].chunk_limits.lock().await;
+        assert_eq!(*limits.start(), 0);
+        assert_eq!(*limits.end(), 999);
+    }
+}
