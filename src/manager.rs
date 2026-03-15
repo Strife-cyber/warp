@@ -17,6 +17,21 @@ pub struct Metadata {
     pub chunks: Mutex<VecDeque<Arc<Chunk>>>,
 }
 
+impl Metadata {
+    /// Creates fresh metadata for a new download.
+    /// The Manager will automatically split the initial chunk based on CPU cores.
+    pub fn new(url: String, size: u64) -> Self {
+        let mut chunks = VecDeque::new();
+        chunks.push_back(Arc::new(Chunk::new(0..=(size - 1), 0)));
+
+        Self {
+            url,
+            size,
+            chunks: Mutex::new(chunks),
+        }
+    }
+}
+
 /// The Orchestrator for the entire download process.
 ///
 /// The `Manager` is responsible for:
@@ -37,7 +52,30 @@ pub struct Manager {
 }
 
 impl Manager {
-    /// Creates a new Manager instance.
+    /// Initializes a Manager, automatically attempting to resume from a .warp file if it exists.
+    pub async fn from_url(url: String, target_path: std::path::PathBuf) -> Result<Self, anyhow::Error> {
+        let warp_path = target_path.with_extension("warp");
+
+        let metadata = if warp_path.exists() {
+            println!("Found .warp file, attempting to resume...");
+            match crate::beat::load_snapshot(&warp_path).await {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Failed to load snapshot: {}. Starting fresh.", e);
+                    // In a real app, you'd fetch the file size via a HEAD request first
+                    Metadata::new(url, 1024 * 1024 * 100) 
+                }
+            }
+        } else {
+            println!("No .warp file found, starting fresh download.");
+            // In a real app, you'd fetch the file size via a HEAD request first
+            Metadata::new(url, 1024 * 1024 * 100) 
+        };
+
+        Ok(Self::new(metadata, target_path))
+    }
+
+    /// Creates a new Manager instance from existing metadata.
     pub fn new(
         metadata: Metadata,
         target_path: std::path::PathBuf,
