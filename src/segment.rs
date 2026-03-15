@@ -152,13 +152,18 @@ async fn perform_download(
         // 2. Prepare the Range header for the request
         handle.seek(SeekFrom::Start(absolute_start)).await?;
 
-        let response = timeout(TIMEOUT, client
+        let response = match timeout(TIMEOUT, client
             .get(url)
             .header("Range", format!("bytes={}-{}", absolute_start, end_offset))
-            .send()).await??;
+            .send()).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => return Err(anyhow::anyhow!("Network error for {}: {}", url, e)),
+                Err(_) => return Err(anyhow::anyhow!("Connection timeout for {}: {}", url, TIMEOUT.as_secs())),
+            };
 
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!("Server returned {}: {}", response.status(), url));
+            return Err(anyhow::anyhow!("Server rejected Range request for {} (Status: {}). Bytes: {}-{}", 
+                url, response.status(), absolute_start, end_offset));
         }
 
         // 3. Process the byte stream

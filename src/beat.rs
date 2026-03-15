@@ -8,7 +8,7 @@ use std::sync::atomic::{Ordering};
 
 /// A serializable snapshot of a single chunk's progress.
 /// Used to save and resume downloads from a `.warp` file.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
 pub struct ChunkSnapshot {
     /// Start byte of the range.
     pub start: u64,
@@ -19,7 +19,7 @@ pub struct ChunkSnapshot {
 }
 
 /// A serializable snapshot of the entire download state.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct MetadataSnapshot {
     /// Source URL.
     pub url: String,
@@ -44,11 +44,13 @@ pub async fn start_heartbeat_sync(
         tokio::select! {
             // Periodic snapshot every second
             _ = interval.tick() => {
-                save_snapshot_sync(&metadata, target_path).await?;
+                if let Err(e) = save_snapshot_sync(&metadata, target_path).await {
+                    eprintln!("Failed to save heartbeat snapshot for {}: {}", target_path.display(), e);
+                }
             },
             // Final snapshot upon manager cancellation/completion
             _ = token.cancelled() => {
-                save_snapshot_sync(&metadata, target_path).await?;
+                let _ = save_snapshot_sync(&metadata, target_path).await;
                 break;
             }
         }
@@ -79,7 +81,8 @@ pub async fn load_snapshot(target_path: &Path) -> Result<Metadata, anyhow::Error
 
 /// Reads and deserializes the `.warp` file from disk.
 async fn load_warp_file(target_path: &Path) -> Result<MetadataSnapshot, anyhow::Error> {
-    let bytes = tokio::fs::read(target_path).await?;
+    let bytes = tokio::fs::read(target_path).await
+        .map_err(|e| anyhow::anyhow!("Failed to read .warp file {}: {}", target_path.display(), e))?;
     Ok(bincode::deserialize(&bytes)?)
 }
 
@@ -89,14 +92,14 @@ async fn load_warp_file(target_path: &Path) -> Result<MetadataSnapshot, anyhow::
 /// 1.  Serializes the state to a memory buffer.
 /// 2.  Writes the buffer to a temporary file (`.warp.tmp`).
 /// 3.  Atomically renames the temporary file to the final destination.
-async fn save_snapshot_sync(metadata: &Metadata, target_path: &Path) -> Result<(), anyhow::Error> {
+pub async fn save_snapshot_sync(metadata: &Metadata, target_path: &Path) -> Result<(), anyhow::Error> {
     let snapshot = create_snapshot_sync(metadata).await;
     let bytes = bincode::serialize(&snapshot)?;
 
     let mut tmp_path = target_path.to_path_buf();
     let file_name = target_path.file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!("Invalid target file name"))?;
+        .ok_or_else(|| anyhow::anyhow!("Invalid target file name for snapshot"))?;
     let tmp_file_name = format!("{}.warp.tmp", file_name);
     tmp_path.set_file_name(tmp_file_name);
 
@@ -165,5 +168,16 @@ mod tests {
         let limits = chunks[0].chunk_limits.lock().await;
         assert_eq!(*limits.start(), 0);
         assert_eq!(*limits.end(), 999);
+    }
+
+    #[tokio::test]
+    async fn test_create_snapshot_sync() {
+        let metadata = Metadata::new("url".to_string(), 1000);
+        let snapshot = create_snapshot_sync(&metadata).await;
+        
+        assert_eq!(snapshot.url, "url");
+        assert_eq!(snapshot.chunks.len(), 1);
+        assert_eq!(snapshot.chunks[0].start, 0);
+        assert_eq!(snapshot.chunks[0].end, 999);
     }
 }

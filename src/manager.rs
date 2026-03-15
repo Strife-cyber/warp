@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::collections::VecDeque;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
-use crate::resources::calculate_optimal_workers;
+use std::sync::atomic::Ordering;
 use crate::segment::{download_worker, Chunk};
 
 /// Holds the essential metadata for a download session.
@@ -30,16 +30,24 @@ impl Metadata {
             chunks: Mutex::new(chunks),
         }
     }
+
+    /// Calculates the total bytes downloaded across all chunks.
+    pub async fn total_progress(&self) -> u64 {
+        let chunks = self.chunks.lock().await;
+        let mut total = 0;
+        for c in chunks.iter() {
+            total += c.progress.load(Ordering::Relaxed);
+        }
+        total
+    }
 }
 
 /// The Orchestrator for the entire download process.
 ///
 /// The `Manager` is responsible for:
-/// 1.  **Resource Balancing:** Determining the right number of workers for the current system state.
-/// 2.  **Concurrency Control:** Using a Semaphore to ensure we never exceed the suggested worker count.
-/// 3.  **Work Distribution:** Managing a shared queue of chunks.
-/// 4.  **Resilience:** Starting the heartbeat task to persist progress snapshots.
-/// 5.  **Dynamic Adaptation:** Splitting chunks if there are fewer chunks than available workers.
+/// 1.  **Work Distribution:** Managing a shared queue of chunks.
+/// 2.  **Resilience:** Starting the heartbeat task to persist progress snapshots.
+/// 3.  **Dynamic Adaptation:** Splitting chunks if there are fewer chunks than available workers.
 pub struct Manager {
     /// Shared state across all workers and the heartbeat.
     metadata: Arc<Metadata>,
@@ -57,17 +65,17 @@ impl Manager {
         let warp_path = target_path.with_extension("warp");
 
         let metadata = if warp_path.exists() {
-            println!("Found .warp file, attempting to resume...");
+            println!("Found .warp file, attempting to resume {}...", target_path.display());
             match crate::beat::load_snapshot(&warp_path).await {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("Failed to load snapshot: {}. Starting fresh.", e);
+                    eprintln!("Failed to load snapshot for {}: {}. Starting fresh.", target_path.display(), e);
                     // In a real app, you'd fetch the file size via a HEAD request first
                     Metadata::new(url, 1024 * 1024 * 100) 
                 }
             }
         } else {
-            println!("No .warp file found, starting fresh download.");
+            println!("No .warp file found for {}, starting fresh download.", target_path.display());
             // In a real app, you'd fetch the file size via a HEAD request first
             Metadata::new(url, 1024 * 1024 * 100) 
         };
@@ -88,32 +96,18 @@ impl Manager {
         }
     }
 
-    /// Starts and manages the download lifecycle.
-    ///
-    /// This method is the main entry point for the download. It follows these steps:
-    /// 1.  Analyzes system resources to set a worker limit.
-    /// 2.  Ensures the target file is pre-allocated on disk.
-    /// 3.  Reconciles the initial chunk count with the worker limit.
-    /// 4.  Spawns the heartbeat task.
-    /// 5.  Enters a loop to spawn workers until all chunks are completed.
-    /// 6.  Cleans up resources upon completion or failure.
-    pub async fn run(&mut self) -> Result<(), anyhow::Error> {
-        // 1. Determine the optimal worker count based on current system resources
-        let stats = calculate_optimal_workers();
-        let suggested_workers = stats.suggested_workers;
-        println!("System CPU: {:.1}%. Target workers: {}", stats.cpu_usage, suggested_workers);
-
-        // 2. Pre-allocate or open the target file to ensure we have disk space
+    /// Starts and manages the download lifecycle, sharing a global worker semaphore.
+    pub async fn run(&mut self, suggested_workers: usize, semaphore: Arc<Semaphore>) -> Result<(), anyhow::Error> {
+        // 1. Pre-allocate or open the target file to ensure we have disk space
         if !self.target_path.exists() {
             let file = tokio::fs::File::create(&self.target_path).await?;
             file.set_len(self.metadata.size).await?;
         }
 
-        // 3. Resource Reconciliation: Split chunks if we have more workers than work.
-        // This ensures that on a multicore machine, we use all available bandwidth immediately.
+        // 2. Resource Reconciliation: Split chunks if we have more workers than work.
         self.reconcile_chunks(suggested_workers).await;
 
-        // 4. Start heartbeat (snapshot persistence)
+        // 3. Start heartbeat (snapshot persistence)
         let hb_metadata = Arc::clone(&self.metadata);
         let hb_token = self.cancel_token.clone();
         let hb_path = self.target_path.with_extension("warp");
@@ -125,13 +119,32 @@ impl Manager {
             }
         });
 
-        // 5. Worker Pool Loop
+        // 4. Start progress logging
+        let log_metadata = Arc::clone(&self.metadata);
+        let log_token = self.cancel_token.clone();
+        let log_target = self.target_path.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let prog = log_metadata.total_progress().await;
+                        let percent = (prog as f64 / log_metadata.size as f64) * 100.0;
+                        println!("[{}] Progress: {:.2}% ({}/{} bytes)", 
+                            log_target.file_name().and_then(|n| n.to_str()).unwrap_or("unknown"),
+                            percent, prog, log_metadata.size);
+                    }
+                    _ = log_token.cancelled() => break,
+                }
+            }
+        });
+
+        // 5. Worker Pool Loop using shared global semaphore
         let mut workers = JoinSet::new();
-        let semaphore = Arc::new(Semaphore::new(suggested_workers));
-        
+
         loop {
             let mut queue = self.metadata.chunks.lock().await;
-            
+
             // Cleanup phase: remove fully completed chunks from the queue
             while let Some(front) = queue.front() {
                 if front.remaining_bytes().await == 0 {
@@ -157,7 +170,7 @@ impl Manager {
                 let path = self.target_path.clone();
                 let url = self.metadata.url.clone();
                 let token = self.cancel_token.clone();
-                
+
                 workers.spawn(async move {
                     let _permit = permit; // Permit is held until this future resolves
                     download_worker(client, path, chunk, url, token).await
@@ -173,17 +186,14 @@ impl Manager {
                         match res {
                             Ok(Ok(())) => {}, // Worker finished its current chunk successfully
                             Ok(Err(e)) => {
-                                eprintln!("Worker error: {}", e);
-                                // Transient errors are ignored here as the chunk 
-                                // will eventually be re-added or handled by stealing.
+                                eprintln!("Worker error on {}: {}", self.target_path.display(), e);
                             }
                             Err(e) => return Err(e.into()), // Task panicked
                         }
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                    // This allows the loop to check for work-stealing opportunities
-                    // even if no workers have finished yet.
+                    // Check for work-stealing opportunities
                 }
             }
         }
@@ -191,7 +201,7 @@ impl Manager {
         // 6. Cleanup: Stop heartbeat and remove the temporary .warp file
         self.cancel_token.cancel();
         let _ = tokio::fs::remove_file(hb_path).await;
-        println!("Download complete.");
+        println!("Download complete: {}", self.target_path.display());
 
         Ok(())
     }
@@ -203,7 +213,7 @@ impl Manager {
         while queue.len() < target_count {
             let mut largest_idx = None;
             let mut max_rem = 0;
-            
+
             for (i, chunk) in queue.iter().enumerate() {
                 let rem = chunk.remaining_bytes().await;
                 if rem > max_rem {
@@ -238,6 +248,7 @@ use tokio::time::Duration;
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_metadata_new() {
@@ -245,15 +256,15 @@ mod tests {
         let url = "http://example.com".to_string();
         let size = 1000;
         let metadata = Metadata::new(url.clone(), size);
-        
+
         // Verify core properties.
         assert_eq!(metadata.url, url);
         assert_eq!(metadata.size, size);
-        
+
         // Verify the initial chunk structure.
         let chunks = metadata.chunks.lock().await;
         assert_eq!(chunks.len(), 1, "Metadata should start with exactly one chunk");
-        
+
         let chunk_limits = chunks[0].chunk_limits.lock().await;
         assert_eq!(*chunk_limits.start(), 0);
         assert_eq!(*chunk_limits.end(), 999);
@@ -266,7 +277,7 @@ mod tests {
         let metadata = Metadata::new(url, 1000);
         let target_path = PathBuf::from("test.mp4");
         let manager = Manager::new(metadata, target_path.clone());
-        
+
         // Verify state initialization.
         assert_eq!(manager.target_path, target_path);
         assert!(!manager.cancel_token.is_cancelled(), "Manager should start in an active state");
@@ -276,7 +287,7 @@ mod tests {
     async fn test_reconcile_chunks() {
         // Goal: Verify that the Manager can automatically split an initial large chunk 
         // to match a target worker count (Resource Reconciliation).
-        
+
         // Create 100MB metadata (starts as 1 chunk).
         let metadata = Metadata::new("url".to_string(), 100 * 1024 * 1024);
         let manager = Manager::new(metadata, PathBuf::from("test"));
@@ -287,7 +298,7 @@ mod tests {
 
         let chunks = manager.metadata.chunks.lock().await;
         assert!(chunks.len() >= 4, "Reconciliation should have increased chunk count to at least 4");
-        
+
         // Ensure no data loss: total size of all chunks should still be 100MB.
         let mut total_range_sum = 0;
         for c in chunks.iter() {
@@ -295,5 +306,27 @@ mod tests {
             total_range_sum += (*limits.end() - *limits.start()) + 1;
         }
         assert_eq!(total_range_sum, 100 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_manager_resume_logic() {
+        // Goal: Ensure Manager::from_url correctly loads a .warp file if it exists.
+        let dir = tempdir().unwrap();
+        let target_path = dir.path().join("download.zip");
+        let warp_path = target_path.with_extension("warp");
+
+        // 1. Manually create a .warp file.
+        let metadata = Metadata::new("http://test.com".to_string(), 5000);
+        {
+            let chunks = metadata.chunks.lock().await;
+            chunks[0].progress.store(2500, Ordering::SeqCst);
+        }
+        crate::beat::save_snapshot_sync(&metadata, &warp_path).await.unwrap();
+
+        // 2. Load manager using from_url.
+        let manager = Manager::from_url("http://test.com".to_string(), target_path).await.unwrap();
+
+        // 3. Verify progress was restored.
+        assert_eq!(manager.metadata.total_progress().await, 2500);
     }
 }

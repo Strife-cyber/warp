@@ -1,6 +1,6 @@
 //! # Warp - High Performance Download Accelerator
 //!
-//! Warp is a multi-threaded download manager designed to utilize system resources
+//! Warp is a multithreaded download manager designed to utilize system resources
 //! efficiently while ensuring download integrity through atomic progress tracking
 //! and a heartbeat-based snapshot system.
 
@@ -8,18 +8,35 @@ mod segment;
 pub mod manager;
 mod beat;
 mod resources;
+mod registry;
+mod cli;
+mod engine;
 
-use std::path::PathBuf;
-use crate::manager::Manager;
+use clap::Parser;
+use crate::cli::{Cli, Commands};
+use crate::registry::Registry;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let url = "http://uf3qp40g0f.y9a8ua48mhss5ye.cyou/rlink_t/432ca7c011673093e49aa5bfc7f33306/c28d75b4142b6e057fa613cb532c59cc/9cd23ba0cc4bdf9074a55b24b567f6fc/White_Collar_-_S2_-_E3_62ac2e31b27ab5b98680e35d1bba43f4.mp4".to_string();
-    let target_path = PathBuf::from("White_Collar_-_S2_-_E3_62ac2e31b27ab5b98680e35d1bba43f4.mp4");
+    let cli = Cli::parse();
 
-    // Initialize and run the manager
-    let mut manager = Manager::from_url(url, target_path).await?;
-    manager.run().await?;
+    // Load the global registry
+    let mut registry = Registry::load()?;
+
+    match cli.command {
+        Commands::Add { url, output } => {
+            cli::handle_add(url, output, &mut registry)?;
+        }
+        Commands::List => {
+            cli::handle_list(&registry);
+        }
+        Commands::Remove { id } => {
+            cli::handle_remove(id, &mut registry)?;
+        }
+        Commands::Run => {
+            engine::run_all(&mut registry).await?;
+        }
+    }
 
     Ok(())
 }
