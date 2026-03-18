@@ -4,6 +4,8 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use std::sync::atomic::Ordering;
 use crate::segment::{download_worker, Chunk};
+use indicatif::ProgressBar;
+use crate::utils::HumanBytes;
 
 /// Holds the essential metadata for a download session.
 pub struct Metadata {
@@ -72,6 +74,8 @@ pub struct Manager {
     cancel_token: tokio_util::sync::CancellationToken,
     /// Local path where the file will be saved.
     pub target_path: std::path::PathBuf,
+    /// Progress bar for this download.
+    pb: Option<ProgressBar>,
 }
 
 impl Manager {
@@ -95,7 +99,6 @@ impl Manager {
         let client = Arc::new(reqwest::Client::new());
 
         let metadata = if warp_path.exists() {
-            println!("Found .warp file, attempting to resume {}...", target_path.display());
             match crate::beat::load_snapshot(&warp_path).await {
                 Ok(m) => m,
                 Err(e) => {
@@ -105,7 +108,6 @@ impl Manager {
                 }
             }
         } else {
-            println!("No .warp file found for {}, starting fresh download.", target_path.display());
             let size = Self::fetch_content_length(&client, &url).await?;
             Metadata::new(url, size) 
         };
@@ -119,7 +121,12 @@ impl Manager {
             client,
             cancel_token: tokio_util::sync::CancellationToken::new(),
             target_path,
+            pb: None,
         }
+    }
+
+    pub fn set_progress_bar(&mut self, pb: ProgressBar) {
+        self.pb = Some(pb);
     }
 
     /// Starts and manages the download lifecycle.
@@ -145,17 +152,26 @@ impl Manager {
         // Progress logging task
         let log_metadata = Arc::clone(&self.metadata);
         let log_token = self.cancel_token.clone();
-        let log_target = self.target_path.clone();
+        let pb = self.pb.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
+            let mut last_progress = log_metadata.total_progress().await;
+            
+            if let Some(ref pbar) = pb {
+                pbar.set_position(last_progress);
+            }
+
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
                         let prog = log_metadata.total_progress().await;
-                        let percent = (prog as f64 / log_metadata.size as f64) * 100.0;
-                        println!("[{}] Progress: {:.2}% ({}/{} bytes)", 
-                            log_target.file_name().and_then(|n| n.to_str()).unwrap_or("unknown"),
-                            percent, prog, log_metadata.size);
+                        if let Some(ref pbar) = pb {
+                            pbar.set_position(prog);
+                            let delta = prog.saturating_sub(last_progress);
+                            let speed = delta * 2; // Since we tick every 500ms
+                            pbar.set_message(format!("{} /s", HumanBytes(speed)));
+                        }
+                        last_progress = prog;
                     }
                     _ = log_token.cancelled() => break,
                 }
@@ -238,7 +254,9 @@ impl Manager {
 
         self.cancel_token.cancel();
         let _ = tokio::fs::remove_file(hb_path).await;
-        println!("Download complete: {}", self.target_path.display());
+        if let Some(ref pbar) = self.pb {
+            pbar.finish_with_message("Done");
+        }
 
         Ok(())
     }

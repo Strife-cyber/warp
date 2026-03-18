@@ -34,6 +34,23 @@ pub enum Commands {
         /// The ID of the download to inspect
         id: String,
     },
+    /// Pauses a download
+    Pause {
+        /// The ID of the download to pause
+        id: String,
+    },
+    /// Resumes a paused download
+    Resume {
+        /// The ID of the download to resume
+        id: String,
+    },
+    /// Retries a download that failed with an error
+    Retry {
+        /// The ID of the download to retry
+        id: String,
+    },
+    /// Removes all completed downloads from the registry
+    Clean,
 }
 
 pub async fn handle_add(url: String, output: Option<PathBuf>, registry: &mut Registry) -> Result<()> {
@@ -143,6 +160,46 @@ pub async fn handle_inspect(id: String, registry: &Registry) -> Result<()> {
     } else {
         println!("Download ID {} not found.", id);
     }
+    Ok(())
+}
+
+pub fn handle_pause(id: String, registry: &mut Registry) -> Result<()> {
+    if registry.downloads.contains_key(&id) {
+        registry.update_status(&id, crate::registry::DownloadStatus::Paused);
+        registry.save()?;
+        println!("Paused download: {}", id);
+    } else {
+        println!("Download ID {} not found.", id);
+    }
+    Ok(())
+}
+
+pub fn handle_resume(id: String, registry: &mut Registry) -> Result<()> {
+    if registry.downloads.contains_key(&id) {
+        registry.update_status(&id, crate::registry::DownloadStatus::Pending);
+        registry.save()?;
+        println!("Resumed download: {}", id);
+    } else {
+        println!("Download ID {} not found.", id);
+    }
+    Ok(())
+}
+
+pub fn handle_retry(id: String, registry: &mut Registry) -> Result<()> {
+    if registry.downloads.contains_key(&id) {
+        registry.update_status(&id, crate::registry::DownloadStatus::Pending);
+        registry.save()?;
+        println!("Retrying download: {}", id);
+    } else {
+        println!("Download ID {} not found.", id);
+    }
+    Ok(())
+}
+
+pub fn handle_clean(registry: &mut Registry) -> Result<()> {
+    let removed = registry.clean_completed();
+    registry.save()?;
+    println!("Cleaned {} completed downloads.", removed);
     Ok(())
 }
 

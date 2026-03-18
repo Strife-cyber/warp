@@ -98,6 +98,13 @@ impl Registry {
             entry.status = status;
         }
     }
+
+    /// Removes all completed downloads from the registry.
+    pub fn clean_completed(&mut self) -> usize {
+        let before = self.downloads.len();
+        self.downloads.retain(|_, entry| entry.status != DownloadStatus::Completed);
+        before - self.downloads.len()
+    }
 }
 
 #[cfg(test)]

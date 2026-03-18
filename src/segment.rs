@@ -136,6 +136,9 @@ async fn perform_download(
     chunk: &Chunk,
     url: &str,
 ) -> Result<(), anyhow::Error> {
+    let mut retry_count = 0;
+    let max_retries = 5;
+
     loop {
         // 1. Fetch current limits and progress. This handle resumes.
         let (start_offset, end_offset, current_progress) = {
@@ -152,16 +155,34 @@ async fn perform_download(
         // 2. Prepare the Range header for the request
         handle.seek(SeekFrom::Start(absolute_start)).await?;
 
-        let response = match timeout(TIMEOUT, client
+        let response_res = timeout(TIMEOUT, client
             .get(url)
             .header("Range", format!("bytes={}-{}", absolute_start, end_offset))
-            .send()).await {
-                Ok(Ok(resp)) => resp,
-                Ok(Err(e)) => return Err(anyhow::anyhow!("Network error for {}: {}", url, e)),
-                Err(_) => return Err(anyhow::anyhow!("Connection timeout for {}: {}", url, TIMEOUT.as_secs())),
-            };
+            .send()).await;
+
+        let response = match response_res {
+            Ok(Ok(resp)) => resp,
+            _ => {
+                if retry_count < max_retries {
+                    retry_count += 1;
+                    let delay = Duration::from_secs(2u64.pow(retry_count));
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                match response_res {
+                    Ok(Err(e)) => return Err(anyhow::anyhow!("Network error for {}: {}", url, e)),
+                    Err(_) => return Err(anyhow::anyhow!("Connection timeout for {}: {}", url, TIMEOUT.as_secs())),
+                    _ => unreachable!(),
+                }
+            }
+        };
 
         if !response.status().is_success() {
+            if response.status().is_server_error() && retry_count < max_retries {
+                retry_count += 1;
+                tokio::time::sleep(Duration::from_secs(2u64.pow(retry_count))).await;
+                continue;
+            }
             return Err(anyhow::anyhow!("Server rejected Range request for {} (Status: {}). Bytes: {}-{}", 
                 url, response.status(), absolute_start, end_offset));
         }
@@ -169,21 +190,30 @@ async fn perform_download(
         // 3. Process the byte stream
         let mut stream = response.bytes_stream();
         while let Some(item) = stream.next().await {
-            let packet = item?;
+            let packet = match item {
+                Ok(p) => p,
+                Err(e) => {
+                    if retry_count < max_retries {
+                        retry_count += 1;
+                        tokio::time::sleep(Duration::from_secs(2u64.pow(retry_count))).await;
+                        break; // Break stream loop to retry full request
+                    }
+                    return Err(e.into());
+                }
+            };
+            
+            // Reset retry count on successful packet
+            retry_count = 0;
             
             // 4. Re-check limits in case of a split during the stream
-            // If the chunk was split, the new 'end' might be before what we are currently writing.
             let limits = chunk.chunk_limits.lock().await;
             let current_end = *limits.end();
             let current_abs_start = *limits.start() + chunk.progress.load(Ordering::SeqCst);
             
             if current_abs_start > current_end {
-                // The chunk was split, and we've already exceeded the new boundary.
-                // Stop here; the newly created chunk will handle the rest.
                 return Ok(());
             }
             
-            // Calculate how many bytes from the packet are still within our current range
             let bytes_to_write = if current_abs_start + packet.len() as u64 > current_end + 1 {
                 (current_end + 1 - current_abs_start) as usize
             } else {
@@ -194,12 +224,10 @@ async fn perform_download(
             chunk.progress.fetch_add(bytes_to_write as u64, Ordering::SeqCst);
             
             if bytes_to_write < packet.len() {
-                // We reached the new limit imposed by a split
                 return Ok(());
             }
         }
         
-        // Final verification: If we completed the stream, check if we actually finished the chunk.
         let final_progress = chunk.progress.load(Ordering::SeqCst);
         let final_limits = chunk.chunk_limits.lock().await;
         if final_progress >= (*final_limits.end() - *final_limits.start()) + 1 {

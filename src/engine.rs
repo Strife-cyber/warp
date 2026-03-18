@@ -5,6 +5,7 @@ use crate::registry::{Registry, DownloadStatus};
 use crate::manager::Manager;
 use crate::resources::calculate_optimal_workers;
 use anyhow::Result;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 pub async fn run_all(registry: &mut Registry) -> Result<()> {
     let stats = calculate_optimal_workers();
@@ -16,6 +17,7 @@ pub async fn run_all(registry: &mut Registry) -> Result<()> {
     // Global semaphore shared across ALL managers
     let semaphore = Arc::new(Semaphore::new(suggested_workers));
     let mut managers = JoinSet::new();
+    let multi_progress = MultiProgress::new();
 
     // Find all incomplete downloads
     for (id, entry) in registry.downloads.iter_mut() {
@@ -27,21 +29,31 @@ pub async fn run_all(registry: &mut Registry) -> Result<()> {
         let target_path = entry.target_path.clone();
         let id_clone = id.clone();
         let sem_clone = Arc::clone(&semaphore);
-
+        
+        let pb = multi_progress.add(ProgressBar::new(0));
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")
+            .unwrap()
+            .progress_chars("#>-"));
+        
         // Transition state to downloading
         entry.status = DownloadStatus::Downloading;
 
         // Spawn a task for each manager
         managers.spawn(async move {
-            println!("Initializing Manager for {}", id_clone);
             match Manager::from_url(url, target_path).await {
                 Ok(mut manager) => {
+                    pb.set_length(manager.metadata.size);
+                    manager.set_progress_bar(pb);
                     match manager.run(suggested_workers, sem_clone).await {
                         Ok(_) => Ok((id_clone, DownloadStatus::Completed)),
                         Err(e) => Err((id_clone, e.to_string())),
                     }
                 }
-                Err(e) => Err((id_clone, e.to_string())),
+                Err(e) => {
+                    pb.finish_with_message(format!("Error: {}", e));
+                    Err((id_clone, e.to_string()))
+                },
             }
         });
     }
@@ -61,7 +73,6 @@ pub async fn run_all(registry: &mut Registry) -> Result<()> {
                 registry.update_status(&id, new_status);
             }
             Ok(Err((id, err_msg))) => {
-                eprintln!("Download {} failed: {}", id, err_msg);
                 registry.update_status(&id, DownloadStatus::Error(err_msg));
             }
             Err(e) => {

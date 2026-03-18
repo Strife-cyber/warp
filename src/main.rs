@@ -11,6 +11,7 @@ mod resources;
 mod registry;
 mod cli;
 mod engine;
+pub mod utils;
 
 use clap::Parser;
 use crate::cli::{Cli, Commands};
@@ -38,6 +39,18 @@ async fn main() -> Result<(), anyhow::Error> {
         }
         Commands::Inspect { id } => {
             cli::handle_inspect(id, &registry).await?;
+        }
+        Commands::Pause { id } => {
+            cli::handle_pause(id, &mut registry)?;
+        }
+        Commands::Resume { id } => {
+            cli::handle_resume(id, &mut registry)?;
+        }
+        Commands::Retry { id } => {
+            cli::handle_retry(id, &mut registry)?;
+        }
+        Commands::Clean => {
+            cli::handle_clean(&mut registry)?;
         }
     }
 
