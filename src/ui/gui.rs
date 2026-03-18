@@ -88,13 +88,13 @@ impl eframe::App for WarpApp {
             }
 
             // Create a table-like layout
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::ScrollArea::both().show(ui, |ui| {
                 for (id, progress) in state.iter() {
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
                             // Column 1: Info (Path and URL)
                             ui.vertical(|ui| {
-                                ui.set_min_width(300.0);
+                                ui.set_min_width(250.0);
                                 ui.label(egui::RichText::new(&progress.target_path).strong().size(15.0));
                                 let display_url = if progress.url.len() > 40 {
                                     format!("{}...", &progress.url[..37])
@@ -106,7 +106,7 @@ impl eframe::App for WarpApp {
 
                             // Column 2: Status & Speed
                             ui.vertical(|ui| {
-                                ui.set_min_width(120.0);
+                                ui.set_min_width(100.0);
                                 let status_text = match progress.status {
                                     crate::registry::DownloadStatus::Downloading => "Downloading",
                                     crate::registry::DownloadStatus::Paused => "Paused",
@@ -131,7 +131,7 @@ impl eframe::App for WarpApp {
 
                             // Column 3: Progress Bar
                             ui.vertical(|ui| {
-                                ui.set_min_width(220.0);
+                                ui.set_min_width(200.0);
                                 let fraction = if progress.total > 0 {
                                     progress.downloaded as f32 / progress.total as f32
                                 } else if progress.status == crate::registry::DownloadStatus::Completed {

@@ -244,21 +244,22 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
 
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                let state = app.backend.state.read().unwrap();
-                let mut items: Vec<String> = state.keys().cloned().collect();
-                items.sort();
-                let item_count = items.len();
-                
-                let selected_id = if let Some(idx) = app.table_state.selected() {
-                    if idx < items.len() {
-                        Some(items[idx].clone())
-                    } else { None }
-                } else { None };
-                drop(state);
+                if key.kind == event::KeyEventKind::Press {
+                    let state = app.backend.state.read().unwrap();
+                    let mut items: Vec<String> = state.keys().cloned().collect();
+                    items.sort();
+                    let item_count = items.len();
+                    
+                    let selected_id = if let Some(idx) = app.table_state.selected() {
+                        if idx < items.len() {
+                            Some(items[idx].clone())
+                        } else { None }
+                    } else { None };
+                    drop(state);
 
-                match app.input_mode {
-                    InputMode::Normal => match key.code {
-                        KeyCode::Char('q') => {
+                    match app.input_mode {
+                        InputMode::Normal => match key.code {
+                            KeyCode::Char('q') => {
                             let _ = app.backend.tx.try_send(UiMessage::Quit);
                             return Ok(());
                         }
@@ -321,5 +322,6 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
             }
         }
     }
+}
 }
 
