@@ -71,7 +71,7 @@ pub struct Manager {
     /// Reusable HTTP client for all worker tasks.
     client: Arc<reqwest::Client>,
     /// Master switch to stop all operations (workers and heartbeat).
-    cancel_token: tokio_util::sync::CancellationToken,
+    pub cancel_token: tokio_util::sync::CancellationToken,
     /// Local path where the file will be saved.
     pub target_path: std::path::PathBuf,
     /// Progress bar for this download.

@@ -12,6 +12,7 @@ mod registry;
 mod cli;
 mod engine;
 pub mod utils;
+pub mod ui;
 
 use clap::Parser;
 use crate::cli::{Cli, Commands};
@@ -51,6 +52,12 @@ async fn main() -> Result<(), anyhow::Error> {
         }
         Commands::Clean => {
             cli::handle_clean(&mut registry)?;
+        }
+        Commands::Tui => {
+            ui::tui::run(registry)?;
+        }
+        Commands::Gui => {
+            ui::gui::run(registry).map_err(|e| anyhow::anyhow!("GUI error: {}", e))?;
         }
     }
 

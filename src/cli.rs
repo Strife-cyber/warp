@@ -51,6 +51,10 @@ pub enum Commands {
     },
     /// Removes all completed downloads from the registry
     Clean,
+    /// Launches the interactive Terminal UI (Power User mode)
+    Tui,
+    /// Launches the Graphical Desktop UI (Simple User mode)
+    Gui,
 }
 
 pub async fn handle_add(url: String, output: Option<PathBuf>, registry: &mut Registry) -> Result<()> {
