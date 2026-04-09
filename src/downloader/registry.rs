@@ -1,8 +1,8 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
-use serde::{Serialize, Deserialize};
 use directories::ProjectDirs;
 use anyhow::{Context, Result};
+use std::collections::HashMap;
+use serde::{Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum DownloadStatus {

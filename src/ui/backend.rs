@@ -2,8 +2,8 @@ use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::{mpsc, Semaphore};
-use crate::registry::{Registry, DownloadStatus};
-use crate::manager::Manager;
+use crate::downloader::registry::{Registry, DownloadStatus};
+use crate::downloader::manager::Manager;
 use tokio::task::JoinSet;
 
 #[derive(Clone, Debug)]
@@ -61,7 +61,7 @@ impl UiBackend {
 
         let tx_task = tx.clone();
         tokio::spawn(async move {
-            let worker_limit = crate::resources::calculate_optimal_workers().suggested_workers;
+            let worker_limit = crate::downloader::resources::calculate_optimal_workers().suggested_workers;
             let semaphore = Arc::new(Semaphore::new(worker_limit));
             
             let mut active_downloads = JoinSet::new();

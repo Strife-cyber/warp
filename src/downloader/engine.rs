@@ -1,10 +1,10 @@
 use std::sync::Arc;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
-use crate::registry::{Registry, DownloadStatus};
-use crate::manager::Manager;
-use crate::resources::calculate_optimal_workers;
 use anyhow::Result;
+use tokio::task::JoinSet;
+use tokio::sync::Semaphore;
+use super::manager::Manager;
+use super::registry::{Registry, DownloadStatus};
+use super::resources::calculate_optimal_workers;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 pub async fn run_all(registry: &mut Registry) -> Result<()> {
@@ -32,8 +32,7 @@ pub async fn run_all(registry: &mut Registry) -> Result<()> {
         
         let pb = multi_progress.add(ProgressBar::new(0));
         pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")
-            .unwrap()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")?
             .progress_chars("#>-"));
         
         // Transition state to downloading

@@ -1,10 +1,12 @@
 use std::sync::Arc;
 use std::path::Path;
 use std::time::Duration;
-use crate::segment::Chunk;
-use crate::manager::Metadata;
-use tokio_util::sync::CancellationToken;
+use super::segment::Chunk;
+use tokio::sync::MutexGuard;
+use super::manager::Metadata;
+use std::collections::VecDeque;
 use std::sync::atomic::{Ordering};
+use tokio_util::sync::CancellationToken;
 
 /// A serializable snapshot of a single chunk's progress.
 /// Used to save and resume downloads from a `.warp` file.
@@ -66,7 +68,7 @@ pub async fn start_heartbeat_sync(
 pub async fn load_snapshot(target_path: &Path) -> Result<Metadata, anyhow::Error> {
     let snapshot = load_warp_file(target_path).await?;
 
-    let mut chunks = std::collections::VecDeque::new();
+    let mut chunks = VecDeque::new();
     for c in snapshot.chunks {
         // Reconstruct each chunk with its previously saved progress
         chunks.push_back(Arc::new(Chunk::new(c.start..=c.end, c.progress)));
@@ -117,7 +119,7 @@ async fn create_snapshot_sync(metadata: &Metadata) -> MetadataSnapshot {
     
     // 1. Capture waiting chunks
     {
-        let chunks_guard = metadata.chunks.lock().await;
+        let chunks_guard: MutexGuard<VecDeque<Arc<Chunk>>> = metadata.chunks.lock().await;
         for chunk_arc in chunks_guard.iter() {
             let limits = chunk_arc.chunk_limits.lock().await;
             chunks.push(ChunkSnapshot {
@@ -130,7 +132,7 @@ async fn create_snapshot_sync(metadata: &Metadata) -> MetadataSnapshot {
 
     // 2. Capture active chunks (currently with workers)
     {
-        let active_guard = metadata.active_chunks.lock().await;
+        let active_guard: MutexGuard<Vec<Arc<Chunk>>> = metadata.active_chunks.lock().await;
         for chunk_arc in active_guard.iter() {
             let limits = chunk_arc.chunk_limits.lock().await;
             chunks.push(ChunkSnapshot {
@@ -143,7 +145,7 @@ async fn create_snapshot_sync(metadata: &Metadata) -> MetadataSnapshot {
 
     // 3. Capture completed chunks
     {
-        let completed_guard = metadata.completed_chunks.lock().await;
+        let completed_guard: MutexGuard<Vec<Arc<Chunk>>> = metadata.completed_chunks.lock().await;
         for chunk_arc in completed_guard.iter() {
             let limits = chunk_arc.chunk_limits.lock().await;
             chunks.push(ChunkSnapshot {
@@ -191,7 +193,7 @@ mod tests {
         assert_eq!(loaded_metadata.url, "http://test.com");
         assert_eq!(loaded_metadata.size, 1000);
 
-        let chunks = loaded_metadata.chunks.lock().await;
+        let chunks: MutexGuard<VecDeque<Arc<Chunk>>> = loaded_metadata.chunks.lock().await;
         assert_eq!(chunks.len(), 1, "Should have loaded exactly one chunk");
         assert_eq!(chunks[0].progress.load(Ordering::SeqCst), 500, "Loaded progress should match saved progress");
         

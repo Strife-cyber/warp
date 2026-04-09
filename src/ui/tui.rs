@@ -1,6 +1,6 @@
-use crate::registry::Registry;
+use crate::downloader::registry::Registry;
 use crate::ui::backend::{UiBackend, UiMessage};
-use crate::utils::HumanBytes;
+use crate::downloader::utils::HumanBytes;
 use anyhow::Result;
 use std::io;
 use std::path::PathBuf;
@@ -156,21 +156,21 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
             let mut rows = Vec::new();
             for (_, progress) in &items {
                 let status_str = match progress.status {
-                    crate::registry::DownloadStatus::Downloading => "Downloading",
-                    crate::registry::DownloadStatus::Paused => "Paused",
-                    crate::registry::DownloadStatus::Error(_) => "Error",
-                    crate::registry::DownloadStatus::Completed => "Completed",
-                    crate::registry::DownloadStatus::Pending => "Pending",
+                    crate::downloader::registry::DownloadStatus::Downloading => "Downloading",
+                    crate::downloader::registry::DownloadStatus::Paused => "Paused",
+                    crate::downloader::registry::DownloadStatus::Error(_) => "Error",
+                    crate::downloader::registry::DownloadStatus::Completed => "Completed",
+                    crate::downloader::registry::DownloadStatus::Pending => "Pending",
                 };
                 let status_color = match progress.status {
-                    crate::registry::DownloadStatus::Downloading => Color::Green,
-                    crate::registry::DownloadStatus::Paused => Color::Yellow,
-                    crate::registry::DownloadStatus::Error(_) => Color::Red,
-                    crate::registry::DownloadStatus::Completed => Color::LightBlue,
-                    crate::registry::DownloadStatus::Pending => Color::DarkGray,
+                    crate::downloader::registry::DownloadStatus::Downloading => Color::Green,
+                    crate::downloader::registry::DownloadStatus::Paused => Color::Yellow,
+                    crate::downloader::registry::DownloadStatus::Error(_) => Color::Red,
+                    crate::downloader::registry::DownloadStatus::Completed => Color::LightBlue,
+                    crate::downloader::registry::DownloadStatus::Pending => Color::DarkGray,
                 };
                 
-                let speed_str = if progress.status == crate::registry::DownloadStatus::Downloading {
+                let speed_str = if progress.status == crate::downloader::registry::DownloadStatus::Downloading {
                     format!("{}/s", HumanBytes(progress.speed))
                 } else {
                     "-".to_string()
@@ -178,7 +178,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
 
                 let frac = if progress.total > 0 {
                     progress.downloaded as f32 / progress.total as f32
-                } else if progress.status == crate::registry::DownloadStatus::Completed {
+                } else if progress.status == crate::downloader::registry::DownloadStatus::Completed {
                     1.0
                 } else {
                     0.0

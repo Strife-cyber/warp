@@ -1,11 +1,11 @@
 use std::sync::Arc;
-use std::collections::VecDeque;
-use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
-use std::sync::atomic::Ordering;
-use crate::segment::{download_worker, Chunk};
 use indicatif::ProgressBar;
-use crate::utils::HumanBytes;
+use super::utils::HumanBytes;
+use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
+use tokio::sync::{Mutex, Semaphore};
+use super::segment::{download_worker, Chunk};
 
 /// Holds the essential metadata for a download session.
 pub struct Metadata {
@@ -99,7 +99,7 @@ impl Manager {
         let client = Arc::new(reqwest::Client::new());
 
         let metadata = if warp_path.exists() {
-            match crate::beat::load_snapshot(&warp_path).await {
+            match super::beat::load_snapshot(&warp_path).await {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("Failed to load snapshot for {}: {}. Starting fresh.", target_path.display(), e);
@@ -144,7 +144,7 @@ impl Manager {
         let hb_path_clone = hb_path.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = crate::beat::start_heartbeat_sync(hb_metadata, hb_token, &hb_path_clone).await {
+            if let Err(e) = super::beat::start_heartbeat_sync(hb_metadata, hb_token, &hb_path_clone).await {
                 eprintln!("Heartbeat failed: {}", e);
             }
         });
@@ -154,7 +154,7 @@ impl Manager {
         let log_token = self.cancel_token.clone();
         let pb = self.pb.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
             let mut last_progress = log_metadata.total_progress().await;
             
             if let Some(ref pbar) = pb {
@@ -340,7 +340,7 @@ mod tests {
             let chunks = metadata.chunks.lock().await;
             chunks[0].progress.store(2500, Ordering::SeqCst);
         }
-        crate::beat::save_snapshot_sync(&metadata, &warp_path).await.unwrap();
+        super::super::beat::save_snapshot_sync(&metadata, &warp_path).await.unwrap();
 
         let manager = Manager::from_url("http://test.com".to_string(), target_path).await.unwrap();
         assert_eq!(manager.metadata.total_progress().await, 2500);

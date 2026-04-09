@@ -1,7 +1,7 @@
-use clap::{Parser, Subcommand};
-use std::path::PathBuf;
-use crate::registry::Registry;
 use anyhow::Result;
+use std::path::PathBuf;
+use super::registry::Registry;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -108,7 +108,7 @@ pub fn handle_list(registry: &Registry) {
     
     for (id, entry) in &registry.downloads {
         let status_str = match &entry.status {
-            crate::registry::DownloadStatus::Error(_) => "Error".to_string(),
+            super::registry::DownloadStatus::Error(_) => "Error".to_string(),
             s => format!("{:?}", s),
         };
 
@@ -155,7 +155,7 @@ pub async fn handle_inspect(id: String, registry: &Registry) -> Result<()> {
         }
 
         println!("Inspecting snapshot: {}", warp_path.display());
-        let snapshot = crate::beat::load_warp_file(&warp_path).await?;
+        let snapshot = super::beat::load_warp_file(&warp_path).await?;
         
         let toml_string = toml::to_string_pretty(&snapshot)?;
         println!("\n--- .warp Content (TOML) ---\n");
@@ -169,7 +169,7 @@ pub async fn handle_inspect(id: String, registry: &Registry) -> Result<()> {
 
 pub fn handle_pause(id: String, registry: &mut Registry) -> Result<()> {
     if registry.downloads.contains_key(&id) {
-        registry.update_status(&id, crate::registry::DownloadStatus::Paused);
+        registry.update_status(&id, super::registry::DownloadStatus::Paused);
         registry.save()?;
         println!("Paused download: {}", id);
     } else {
@@ -180,7 +180,7 @@ pub fn handle_pause(id: String, registry: &mut Registry) -> Result<()> {
 
 pub fn handle_resume(id: String, registry: &mut Registry) -> Result<()> {
     if registry.downloads.contains_key(&id) {
-        registry.update_status(&id, crate::registry::DownloadStatus::Pending);
+        registry.update_status(&id, super::registry::DownloadStatus::Pending);
         registry.save()?;
         println!("Resumed download: {}", id);
     } else {
@@ -191,7 +191,7 @@ pub fn handle_resume(id: String, registry: &mut Registry) -> Result<()> {
 
 pub fn handle_retry(id: String, registry: &mut Registry) -> Result<()> {
     if registry.downloads.contains_key(&id) {
-        registry.update_status(&id, crate::registry::DownloadStatus::Pending);
+        registry.update_status(&id, super::registry::DownloadStatus::Pending);
         registry.save()?;
         println!("Retrying download: {}", id);
     } else {

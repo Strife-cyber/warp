@@ -1,10 +1,10 @@
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::timeout;
+use futures_util::StreamExt;
+use tokio_util::sync::CancellationToken;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
-use tokio_util::sync::CancellationToken;
-use futures_util::StreamExt;
-use tokio::time::timeout;
-use std::time::Duration;
 
 /// The default timeout for network requests and stream reads.
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -306,7 +306,7 @@ mod tests {
         
         // New chunk should cover the remaining 15MB.
         assert_eq!(*new_limits.start(), expected_split_point as u64);
-        assert_eq!(*new_limits.end(), (total_size - 1) as u64);
+        assert_eq!(*new_limits.end(), total_size - 1);
         
         // New chunk must start with 0 progress.
         assert_eq!(new_chunk.progress.load(Ordering::SeqCst), 0);

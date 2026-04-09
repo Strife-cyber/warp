@@ -1,6 +1,6 @@
-use crate::registry::Registry;
+use crate::downloader::registry::Registry;
 use crate::ui::backend::{UiBackend, UiMessage};
-use crate::utils::HumanBytes;
+use crate::downloader::utils::HumanBytes;
 use eframe::egui;
 
 /// Entry point for the GUI.
@@ -108,21 +108,21 @@ impl eframe::App for WarpApp {
                             ui.vertical(|ui| {
                                 ui.set_min_width(100.0);
                                 let status_text = match progress.status {
-                                    crate::registry::DownloadStatus::Downloading => "Downloading",
-                                    crate::registry::DownloadStatus::Paused => "Paused",
-                                    crate::registry::DownloadStatus::Error(_) => "Error",
-                                    crate::registry::DownloadStatus::Completed => "Completed",
-                                    crate::registry::DownloadStatus::Pending => "Pending",
+                                    crate::downloader::registry::DownloadStatus::Downloading => "Downloading",
+                                    crate::downloader::registry::DownloadStatus::Paused => "Paused",
+                                    crate::downloader::registry::DownloadStatus::Error(_) => "Error",
+                                    crate::downloader::registry::DownloadStatus::Completed => "Completed",
+                                    crate::downloader::registry::DownloadStatus::Pending => "Pending",
                                 };
                                 let color = match progress.status {
-                                    crate::registry::DownloadStatus::Downloading => egui::Color32::from_rgb(0, 255, 128),
-                                    crate::registry::DownloadStatus::Paused => egui::Color32::YELLOW,
-                                    crate::registry::DownloadStatus::Error(_) => egui::Color32::RED,
-                                    crate::registry::DownloadStatus::Completed => egui::Color32::LIGHT_BLUE,
-                                    crate::registry::DownloadStatus::Pending => egui::Color32::GRAY,
+                                    crate::downloader::registry::DownloadStatus::Downloading => egui::Color32::from_rgb(0, 255, 128),
+                                    crate::downloader::registry::DownloadStatus::Paused => egui::Color32::YELLOW,
+                                    crate::downloader::registry::DownloadStatus::Error(_) => egui::Color32::RED,
+                                    crate::downloader::registry::DownloadStatus::Completed => egui::Color32::LIGHT_BLUE,
+                                    crate::downloader::registry::DownloadStatus::Pending => egui::Color32::GRAY,
                                 };
                                 ui.label(egui::RichText::new(status_text).color(color).strong());
-                                if matches!(progress.status, crate::registry::DownloadStatus::Downloading) {
+                                if matches!(progress.status, crate::downloader::registry::DownloadStatus::Downloading) {
                                     ui.label(format!("{}/s", HumanBytes(progress.speed)));
                                 } else {
                                     ui.label("-");
@@ -134,7 +134,7 @@ impl eframe::App for WarpApp {
                                 ui.set_min_width(200.0);
                                 let fraction = if progress.total > 0 {
                                     progress.downloaded as f32 / progress.total as f32
-                                } else if progress.status == crate::registry::DownloadStatus::Completed {
+                                } else if progress.status == crate::downloader::registry::DownloadStatus::Completed {
                                     1.0
                                 } else {
                                     0.0
@@ -142,7 +142,7 @@ impl eframe::App for WarpApp {
                                 
                                 let text = if progress.total > 0 {
                                     format!("{} / {}", HumanBytes(progress.downloaded), HumanBytes(progress.total))
-                                } else if progress.status == crate::registry::DownloadStatus::Completed {
+                                } else if progress.status == crate::downloader::registry::DownloadStatus::Completed {
                                     format!("{} (Done)", HumanBytes(progress.downloaded))
                                 } else {
                                     format!("{} / ?", HumanBytes(progress.downloaded))
@@ -150,7 +150,7 @@ impl eframe::App for WarpApp {
                                 
                                 ui.add(egui::ProgressBar::new(fraction).text(text).animate(progress.speed > 0));
                                 
-                                if let crate::registry::DownloadStatus::Error(ref msg) = progress.status {
+                                if let crate::downloader::registry::DownloadStatus::Error(ref msg) = progress.status {
                                     ui.label(egui::RichText::new(format!("Err: {}", msg)).small().color(egui::Color32::RED));
                                 }
                             });
@@ -158,8 +158,8 @@ impl eframe::App for WarpApp {
                             // Column 4: Controls
                             ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
-                                    let is_active = matches!(progress.status, crate::registry::DownloadStatus::Downloading | crate::registry::DownloadStatus::Pending);
-                                    let is_resumable = matches!(progress.status, crate::registry::DownloadStatus::Paused | crate::registry::DownloadStatus::Error(_));
+                                    let is_active = matches!(progress.status, crate::downloader::registry::DownloadStatus::Downloading | crate::downloader::registry::DownloadStatus::Pending);
+                                    let is_resumable = matches!(progress.status, crate::downloader::registry::DownloadStatus::Paused | crate::downloader::registry::DownloadStatus::Error(_));
                                     
                                     if is_active {
                                         if ui.button("⏸ Pause").clicked() {
