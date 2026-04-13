@@ -55,6 +55,18 @@ pub enum Commands {
     Tui,
     /// Launches the Graphical Desktop UI (Simple User mode)
     Gui,
+    /// Starts network request interceptor (captures all HTTP/HTTPS traffic)
+    Intercept {
+        /// Optional network interface name (auto-detects if not specified)
+        #[arg(short, long)]
+        interface: Option<String>,
+    },
+    /// Lists captured network requests
+    InterceptList,
+    /// Clears captured network requests
+    InterceptClear,
+    /// Runs interceptor example/simulation (tests without requiring Npcap)
+    Example,
 }
 
 pub async fn handle_add(url: String, output: Option<PathBuf>, registry: &mut Registry) -> Result<()> {
@@ -205,6 +217,99 @@ pub fn handle_clean(registry: &mut Registry) -> Result<()> {
     registry.save()?;
     println!("Cleaned {} completed downloads.", removed);
     Ok(())
+}
+
+#[cfg(feature = "capture")]
+pub async fn handle_intercept(interface: Option<String>) -> Result<()> {
+    use crate::interceptor::{Interceptor, InterceptorConfig};
+    
+    println!("Starting network request interceptor...");
+    if let Some(ref iface) = interface {
+        println!("Using interface: {}", iface);
+    } else {
+        println!("Auto-detecting network interface...");
+    }
+    
+    let config = InterceptorConfig {
+        interface_name: interface,
+        ..Default::default()
+    };
+    
+    let interceptor = Interceptor::new(config);
+    interceptor.start().await?;
+    
+    println!("Interceptor is running. Press Ctrl+C to stop.");
+    println!("Making HTTP requests in another window will be captured here.\n");
+    
+    // Keep running until Ctrl+C
+    tokio::signal::ctrl_c().await?;
+    println!("\nStopping interceptor...");
+    
+    let count = interceptor.count().await;
+    interceptor.stop().await?;
+    println!("Stopped. Total requests captured: {}", count);
+    
+    Ok(())
+}
+
+#[cfg(not(feature = "capture"))]
+pub async fn handle_intercept(_interface: Option<String>) -> Result<()> {
+    Err(anyhow::anyhow!(
+        "The 'intercept' command requires the 'capture' feature. \
+        Run with: cargo run --features capture -- intercept\n\
+        Note: This requires Npcap to be installed on Windows. \
+        Download from: https://nmap.org/npcap/"
+    ))
+}
+
+pub fn handle_example() -> Result<()> {
+    use crate::interceptor::example::simulate_capture;
+    
+    println!("Running interceptor example/simulation...\n");
+    simulate_capture();
+    
+    Ok(())
+}
+
+#[cfg(feature = "capture")]
+pub fn handle_intercept_list() -> Result<()> {
+    use crate::interceptor::{Interceptor, InterceptorConfig};
+    
+    println!("Listing captured requests...\n");
+    println!("Note: This shows requests from a running interceptor instance.");
+    println!("Start an interceptor with: warp intercept\n");
+    println!("For now, run the example to see simulated requests:");
+    println!("  cargo run -- example\n");
+    
+    Ok(())
+}
+
+#[cfg(not(feature = "capture"))]
+pub fn handle_intercept_list() -> Result<()> {
+    Err(anyhow::anyhow!(
+        "The 'intercept-list' command requires the 'capture' feature. \
+        Run with: cargo run --features capture -- intercept-list"
+    ))
+}
+
+#[cfg(feature = "capture")]
+pub fn handle_intercept_clear() -> Result<()> {
+    use crate::interceptor::{Interceptor, InterceptorConfig};
+    
+    println!("Clearing captured requests...");
+    println!("Note: This clears requests from a running interceptor instance.\n");
+    println!("For now, run the example to see simulated requests:");
+    println!("  cargo run -- example\n");
+    
+    Ok(())
+}
+
+#[cfg(not(feature = "capture"))]
+pub fn handle_intercept_clear() -> Result<()> {
+    Err(anyhow::anyhow!(
+        "The 'intercept-clear' command requires the 'capture' feature. \
+        Run with: cargo run --features capture -- intercept-clear"
+    ))
 }
 
 #[cfg(test)]

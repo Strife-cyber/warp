@@ -3,6 +3,12 @@ use crate::ui::backend::{UiBackend, UiMessage};
 use crate::downloader::utils::HumanBytes;
 use eframe::egui;
 
+#[derive(PartialEq)]
+enum GuiTab {
+    Downloads,
+    Interceptor,
+}
+
 /// Entry point for the GUI.
 pub fn run(registry: Registry) -> Result<(), eframe::Error> {
     let backend = UiBackend::spawn(registry);
@@ -25,6 +31,9 @@ pub fn run(registry: Registry) -> Result<(), eframe::Error> {
 struct WarpApp {
     backend: UiBackend,
     new_url: String,
+    current_tab: GuiTab,
+    interceptor_running: bool,
+    captured_requests: Vec<crate::interceptor::types::CapturedRequest>,
 }
 
 impl WarpApp {
@@ -32,6 +41,9 @@ impl WarpApp {
         Self {
             backend,
             new_url: String::new(),
+            current_tab: GuiTab::Downloads,
+            interceptor_running: false,
+            captured_requests: Vec::new(),
         }
     }
 }
@@ -54,31 +66,43 @@ impl eframe::App for WarpApp {
             ui.add_space(8.0);
 
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Add URL:").strong());
-                let text_edit = egui::TextEdit::singleline(&mut self.new_url).desired_width(500.0);
-                ui.add(text_edit);
-                
-                if ui.button("Download").clicked() && !self.new_url.is_empty() {
-                    let url = self.new_url.trim().to_string();
-                    let filename = url.split('/').last().unwrap_or("download.bin")
-                        .split('?').next().unwrap_or("download.bin");
-                    
-                    let path = std::path::PathBuf::from(filename);
-
-                    // Send to backend
-                    let _ = self.backend.tx.try_send(UiMessage::Add(url, path));
-                    self.new_url.clear();
-                }
+                // Tab buttons
+                ui.selectable_value(&mut self.current_tab, GuiTab::Downloads, "Downloads");
+                ui.selectable_value(&mut self.current_tab, GuiTab::Interceptor, "Interceptor");
             });
+            ui.add_space(8.0);
+
+            // Only show URL input on Downloads tab
+            if matches!(self.current_tab, GuiTab::Downloads) {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Add URL:").strong());
+                    let text_edit = egui::TextEdit::singleline(&mut self.new_url).desired_width(500.0);
+                    ui.add(text_edit);
+                    
+                    if ui.button("Download").clicked() && !self.new_url.is_empty() {
+                        let url = self.new_url.trim().to_string();
+                        let filename = url.split('/').last().unwrap_or("download.bin")
+                            .split('?').next().unwrap_or("download.bin");
+                        
+                        let path = std::path::PathBuf::from(filename);
+
+                        // Send to backend
+                        let _ = self.backend.tx.try_send(UiMessage::Add(url, path));
+                        self.new_url.clear();
+                    }
+                });
+            }
             ui.add_space(8.0);
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Active Downloads");
-            ui.separator();
-            ui.add_space(8.0);
+            match self.current_tab {
+                GuiTab::Downloads => {
+                    ui.heading("Active Downloads");
+                    ui.separator();
+                    ui.add_space(8.0);
 
-            let state = self.backend.state.read().unwrap();
+                    let state = self.backend.state.read().unwrap();
             
             if state.is_empty() {
                 ui.centered_and_justified(|ui| {
@@ -181,6 +205,110 @@ impl eframe::App for WarpApp {
                     ui.add_space(4.0);
                 }
             });
+                }
+                GuiTab::Interceptor => {
+                    ui.heading("Network Request Interceptor");
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    // Interceptor controls
+                    ui.horizontal(|ui| {
+                        let status_color = if self.interceptor_running {
+                            egui::Color32::from_rgb(0, 255, 128)
+                        } else {
+                            egui::Color32::RED
+                        };
+                        let status_text = if self.interceptor_running {
+                            "Running"
+                        } else {
+                            "Stopped"
+                        };
+                        ui.label(egui::RichText::new(format!("Status: {}", status_text)).color(status_color).strong());
+
+                        ui.add_space(16.0);
+
+                        if self.interceptor_running {
+                            if ui.button("⏸ Stop").clicked() {
+                                self.interceptor_running = false;
+                            }
+                        } else {
+                            if ui.button("▶ Start").clicked() {
+                                #[cfg(feature = "capture")]
+                                {
+                                    self.interceptor_running = true;
+                                    // Add example request for demo
+                                    self.captured_requests = vec![
+                                        crate::interceptor::types::CapturedRequest {
+                                            id: "1".to_string(),
+                                            timestamp: 0,
+                                            source_ip: "192.168.1.100".to_string(),
+                                            destination_ip: "example.com".to_string(),
+                                            source_port: 54321,
+                                            destination_port: 443,
+                                            protocol: "TCP".to_string(),
+                                            method: Some("GET".to_string()),
+                                            url: Some("/test".to_string()),
+                                            host: Some("example.com".to_string()),
+                                            user_agent: None,
+                                            content_type: None,
+                                            content_length: None,
+                                            headers: std::collections::HashMap::new(),
+                                            payload_size: 100,
+                                        }
+                                    ];
+                                }
+                                #[cfg(not(feature = "capture"))]
+                                {
+                                    // Show message about needing capture feature
+                                }
+                            }
+                        }
+
+                        ui.add_space(8.0);
+
+                        if ui.button("🗑 Clear").clicked() {
+                            self.captured_requests.clear();
+                        }
+                    });
+
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    ui.heading(format!("Captured Requests ({})", self.captured_requests.len()));
+                    ui.add_space(8.0);
+
+                    if self.captured_requests.is_empty() {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(egui::RichText::new("No captured requests").color(egui::Color32::DARK_GRAY).size(18.0));
+                        });
+                        return;
+                    }
+
+                    // Captured requests table
+                    egui::ScrollArea::both().show(ui, |ui| {
+                        for (i, req) in self.captured_requests.iter().enumerate() {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("#{}", i));
+                                    ui.add_space(16.0);
+                                    
+                                    ui.vertical(|ui| {
+                                        let method = req.method.as_deref().unwrap_or("-");
+                                        let url = req.url.as_deref().unwrap_or("-");
+                                        ui.label(egui::RichText::new(format!("{} {}", method, url)).strong());
+                                        ui.label(format!("{}:{} -> {}:{}", 
+                                            req.source_ip, req.source_port,
+                                            req.destination_ip, req.destination_port
+                                        ));
+                                    });
+                                });
+                            });
+                            ui.add_space(4.0);
+                        }
+                    });
+                }
+            }
         });
     }
 }

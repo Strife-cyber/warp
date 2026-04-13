@@ -23,11 +23,19 @@ enum InputMode {
     Editing,
 }
 
+enum Tab {
+    Downloads,
+    Interceptor,
+}
+
 struct App {
     input: String,
     input_mode: InputMode,
     backend: UiBackend,
     table_state: TableState,
+    current_tab: Tab,
+    interceptor_requests: Vec<crate::interceptor::types::CapturedRequest>,
+    interceptor_running: bool,
 }
 
 impl App {
@@ -37,7 +45,18 @@ impl App {
             input_mode: InputMode::Normal,
             backend,
             table_state: TableState::default(),
+            current_tab: Tab::Downloads,
+            interceptor_requests: Vec::new(),
+            interceptor_running: false,
         }
+    }
+
+    fn switch_tab(&mut self) {
+        self.current_tab = match self.current_tab {
+            Tab::Downloads => Tab::Interceptor,
+            Tab::Interceptor => Tab::Downloads,
+        };
+        self.table_state = TableState::default();
     }
 
     fn next(&mut self, item_count: usize) {
@@ -135,7 +154,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
             let title_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
             
             let help_msg = match app.input_mode {
-                InputMode::Normal => "q: Quit | a: Add | p: Pause | r: Resume | d: Delete | Up/Down: Select",
+                InputMode::Normal => match app.current_tab {
+                    Tab::Downloads => "q: Quit | Tab: Switch View | a: Add | p: Pause | r: Resume | d: Delete | Up/Down: Select",
+                    Tab::Interceptor => "q: Quit | Tab: Switch View | s: Start | t: Stop | c: Clear | Up/Down: Select",
+                },
                 InputMode::Editing => "Editing Mode: Enter to submit, Esc to cancel",
             };
 
@@ -145,100 +167,157 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
             let help_para = Paragraph::new(help_msg).block(help_block);
             f.render_widget(help_para, chunks[0]);
 
-            let state = app.backend.state.read().unwrap();
-            let mut items: Vec<(String, crate::ui::backend::DownloadProgress)> = state.iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            items.sort_by(|a, b| a.1.target_path.cmp(&b.1.target_path));
+            // Render based on current tab
+            match app.current_tab {
+                Tab::Downloads => {
+                    let state = app.backend.state.read().unwrap();
+                    let mut items: Vec<(String, crate::ui::backend::DownloadProgress)> = state.iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    items.sort_by(|a, b| a.1.target_path.cmp(&b.1.target_path));
 
+                    let mut rows = Vec::new();
+                    for (_, progress) in &items {
+                        let status_str = match progress.status {
+                            crate::downloader::registry::DownloadStatus::Downloading => "Downloading",
+                            crate::downloader::registry::DownloadStatus::Paused => "Paused",
+                            crate::downloader::registry::DownloadStatus::Error(_) => "Error",
+                            crate::downloader::registry::DownloadStatus::Completed => "Completed",
+                            crate::downloader::registry::DownloadStatus::Pending => "Pending",
+                        };
+                        let status_color = match progress.status {
+                            crate::downloader::registry::DownloadStatus::Downloading => Color::Green,
+                            crate::downloader::registry::DownloadStatus::Paused => Color::Yellow,
+                            crate::downloader::registry::DownloadStatus::Error(_) => Color::Red,
+                            crate::downloader::registry::DownloadStatus::Completed => Color::LightBlue,
+                            crate::downloader::registry::DownloadStatus::Pending => Color::DarkGray,
+                        };
+                        
+                        let speed_str = if progress.status == crate::downloader::registry::DownloadStatus::Downloading {
+                            format!("{}/s", HumanBytes(progress.speed))
+                        } else {
+                            "-".to_string()
+                        };
 
+                        let frac = if progress.total > 0 {
+                            progress.downloaded as f32 / progress.total as f32
+                        } else if progress.status == crate::downloader::registry::DownloadStatus::Completed {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        let pb_str = make_progress_bar(frac, 20);
+                        
+                        let size_str = format!("{}/{}", HumanBytes(progress.downloaded), HumanBytes(progress.total));
 
-            let mut rows = Vec::new();
-            for (_, progress) in &items {
-                let status_str = match progress.status {
-                    crate::downloader::registry::DownloadStatus::Downloading => "Downloading",
-                    crate::downloader::registry::DownloadStatus::Paused => "Paused",
-                    crate::downloader::registry::DownloadStatus::Error(_) => "Error",
-                    crate::downloader::registry::DownloadStatus::Completed => "Completed",
-                    crate::downloader::registry::DownloadStatus::Pending => "Pending",
-                };
-                let status_color = match progress.status {
-                    crate::downloader::registry::DownloadStatus::Downloading => Color::Green,
-                    crate::downloader::registry::DownloadStatus::Paused => Color::Yellow,
-                    crate::downloader::registry::DownloadStatus::Error(_) => Color::Red,
-                    crate::downloader::registry::DownloadStatus::Completed => Color::LightBlue,
-                    crate::downloader::registry::DownloadStatus::Pending => Color::DarkGray,
-                };
-                
-                let speed_str = if progress.status == crate::downloader::registry::DownloadStatus::Downloading {
-                    format!("{}/s", HumanBytes(progress.speed))
-                } else {
-                    "-".to_string()
-                };
+                        let cells = vec![
+                            Cell::from(progress.target_path.clone()),
+                            Cell::from(Span::styled(status_str, Style::default().fg(status_color))),
+                            Cell::from(pb_str),
+                            Cell::from(size_str),
+                            Cell::from(speed_str),
+                        ];
+                        rows.push(Row::new(cells).height(1).bottom_margin(0));
+                    }
 
-                let frac = if progress.total > 0 {
-                    progress.downloaded as f32 / progress.total as f32
-                } else if progress.status == crate::downloader::registry::DownloadStatus::Completed {
-                    1.0
-                } else {
-                    0.0
-                };
-                let pb_str = make_progress_bar(frac, 20);
-                
-                let size_str = format!("{}/{}", HumanBytes(progress.downloaded), HumanBytes(progress.total));
+                    let table_block = Block::default().title(" Downloads ").borders(Borders::ALL);
+                    let header = Row::new(vec!["File", "Status", "Progress", "Size", "Speed"])
+                        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                        .bottom_margin(1);
 
-                let cells = vec![
-                    Cell::from(progress.target_path.clone()),
-                    Cell::from(Span::styled(status_str, Style::default().fg(status_color))),
-                    Cell::from(pb_str),
-                    Cell::from(size_str),
-                    Cell::from(speed_str),
-                ];
-                rows.push(Row::new(cells).height(1).bottom_margin(0));
-            }
+                    let table = Table::new(rows, [
+                        Constraint::Percentage(30),
+                        Constraint::Length(12),
+                        Constraint::Length(22),
+                        Constraint::Length(20),
+                        Constraint::Min(10),
+                    ])
+                    .header(header)
+                    .block(table_block)
+                    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+                    .highlight_symbol(">> ");
 
-            let table_block = Block::default().title(" Downloads ").borders(Borders::ALL);
-            let header = Row::new(vec!["File", "Status", "Progress", "Size", "Speed"])
-                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-                .bottom_margin(1);
+                    f.render_stateful_widget(table, chunks[1], &mut app.table_state);
+                    drop(state);
 
-            let table = Table::new(rows, [
-                Constraint::Percentage(30),
-                Constraint::Length(12),
-                Constraint::Length(22),
-                Constraint::Length(20),
-                Constraint::Min(10),
-            ])
-            .header(header)
-            .block(table_block)
-            .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-            .highlight_symbol(">> ");
+                    let input_title = match app.input_mode {
+                        InputMode::Normal => " (Idle) ",
+                        InputMode::Editing => " Add URL ",
+                    };
+                    
+                    let input_style = match app.input_mode {
+                        InputMode::Normal => Style::default(),
+                        InputMode::Editing => Style::default().fg(Color::Yellow),
+                    };
 
-            f.render_stateful_widget(table, chunks[1], &mut app.table_state);
+                    let input = Paragraph::new(app.input.as_str())
+                        .style(input_style)
+                        .block(Block::default().borders(Borders::ALL).title(input_title));
+                    f.render_widget(input, chunks[2]);
 
-            let input_title = match app.input_mode {
-                InputMode::Normal => " (Idle) ",
-                InputMode::Editing => " Add URL ",
-            };
-            
-            let input_style = match app.input_mode {
-                InputMode::Normal => Style::default(),
-                InputMode::Editing => Style::default().fg(Color::Yellow),
-            };
+                    if let InputMode::Editing = app.input_mode {
+                        f.set_cursor_position((
+                            chunks[2].x + app.input.len() as u16 + 1,
+                            chunks[2].y + 1,
+                        ));
+                    }
+                }
+                Tab::Interceptor => {
+                    // Render interceptor view
+                    let status_text = if app.interceptor_running {
+                        "Status: Running".to_string()
+                    } else {
+                        "Status: Stopped".to_string()
+                    };
+                    let status_color = if app.interceptor_running { Color::Green } else { Color::Red };
 
-            let input = Paragraph::new(app.input.as_str())
-                .style(input_style)
-                .block(Block::default().borders(Borders::ALL).title(input_title));
-            f.render_widget(input, chunks[2]);
-            
-            // Drop read lock before await/handling events!
-            drop(state);
+                    let status_block = Block::default()
+                        .title(" Interceptor Status ")
+                        .borders(Borders::ALL);
+                    let status_para = Paragraph::new(Span::styled(status_text, Style::default().fg(status_color)))
+                        .block(status_block);
+                    f.render_widget(status_para, chunks[1]);
 
-            if let InputMode::Editing = app.input_mode {
-                f.set_cursor_position((
-                    chunks[2].x + app.input.len() as u16 + 1,
-                    chunks[2].y + 1,
-                ));
+                    // Render captured requests table
+                    let mut rows = Vec::new();
+                    for (i, req) in app.interceptor_requests.iter().enumerate() {
+                        let method = req.method.as_deref().unwrap_or("-");
+                        let url = req.url.as_deref().unwrap_or("-");
+                        let url_short = if url.len() > 50 {
+                            format!("{}...", &url[..47])
+                        } else {
+                            url.to_string()
+                        };
+                        
+                        let cells = vec![
+                            Cell::from(i.to_string()),
+                            Cell::from(method),
+                            Cell::from(req.source_ip.clone()),
+                            Cell::from(req.destination_ip.clone()),
+                            Cell::from(url_short),
+                        ];
+                        rows.push(Row::new(cells).height(1).bottom_margin(0));
+                    }
+
+                    let table_block = Block::default().title(" Captured Requests ").borders(Borders::ALL);
+                    let header = Row::new(vec!["#", "Method", "Source", "Dest", "URL"])
+                        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                        .bottom_margin(1);
+
+                    let table = Table::new(rows, [
+                        Constraint::Length(5),
+                        Constraint::Length(8),
+                        Constraint::Length(20),
+                        Constraint::Length(20),
+                        Constraint::Min(30),
+                    ])
+                    .header(header)
+                    .block(table_block)
+                    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+                    .highlight_symbol(">> ");
+
+                    f.render_stateful_widget(table, chunks[2], &mut app.table_state);
+                }
             }
         })?;
 
@@ -258,43 +337,102 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                     drop(state);
 
                     match app.input_mode {
-                        InputMode::Normal => match key.code {
-                            KeyCode::Char('q') => {
-                            let _ = app.backend.tx.try_send(UiMessage::Quit);
-                            return Ok(());
-                        }
-                        KeyCode::Char('a') => {
-                            app.input_mode = InputMode::Editing;
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            app.next(item_count);
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            app.previous(item_count);
-                        }
-                        KeyCode::Char('p') => {
-                            if let Some(id) = selected_id {
-                                let _ = app.backend.tx.try_send(UiMessage::Pause(id));
-                            }
-                        }
-                        KeyCode::Char('r') => {
-                            if let Some(id) = selected_id {
-                                let _ = app.backend.tx.try_send(UiMessage::Resume(id));
-                            }
-                        }
-                        KeyCode::Char('d') => {
-                            if let Some(id) = selected_id {
-                                let _ = app.backend.tx.try_send(UiMessage::Remove(id));
-                                // adjust selection
-                                if let Some(idx) = app.table_state.selected() {
-                                    if idx >= item_count.saturating_sub(1) && idx > 0 {
-                                        app.table_state.select(Some(idx - 1));
+                        InputMode::Normal => match app.current_tab {
+                            Tab::Downloads => match key.code {
+                                KeyCode::Char('q') => {
+                                    let _ = app.backend.tx.try_send(UiMessage::Quit);
+                                    return Ok(());
+                                }
+                                KeyCode::Tab => {
+                                    app.switch_tab();
+                                }
+                                KeyCode::Char('a') => {
+                                    app.input_mode = InputMode::Editing;
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    app.next(item_count);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    app.previous(item_count);
+                                }
+                                KeyCode::Char('p') => {
+                                    if let Some(id) = selected_id {
+                                        let _ = app.backend.tx.try_send(UiMessage::Pause(id));
                                     }
                                 }
-                            }
-                        }
-                        _ => {}
-                    },
+                                KeyCode::Char('r') => {
+                                    if let Some(id) = selected_id {
+                                        let _ = app.backend.tx.try_send(UiMessage::Resume(id));
+                                    }
+                                }
+                                KeyCode::Char('d') => {
+                                    if let Some(id) = selected_id {
+                                        let _ = app.backend.tx.try_send(UiMessage::Remove(id));
+                                        // adjust selection
+                                        if let Some(idx) = app.table_state.selected() {
+                                            if idx >= item_count.saturating_sub(1) && idx > 0 {
+                                                app.table_state.select(Some(idx - 1));
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            },
+                            Tab::Interceptor => match key.code {
+                                KeyCode::Char('q') => {
+                                    let _ = app.backend.tx.try_send(UiMessage::Quit);
+                                    return Ok(());
+                                }
+                                KeyCode::Tab => {
+                                    app.switch_tab();
+                                }
+                                KeyCode::Char('s') => {
+                                    // Start interceptor (placeholder - requires capture feature)
+                                    #[cfg(feature = "capture")]
+                                    {
+                                        app.interceptor_running = true;
+                                        // Add some example requests for demo
+                                        app.interceptor_requests = vec![
+                                            crate::interceptor::types::CapturedRequest {
+                                                id: "1".to_string(),
+                                                timestamp: 0,
+                                                source_ip: "192.168.1.100".to_string(),
+                                                destination_ip: "example.com".to_string(),
+                                                source_port: 54321,
+                                                destination_port: 443,
+                                                protocol: "TCP".to_string(),
+                                                method: Some("GET".to_string()),
+                                                url: Some("/test".to_string()),
+                                                host: Some("example.com".to_string()),
+                                                user_agent: None,
+                                                content_type: None,
+                                                content_length: None,
+                                                headers: std::collections::HashMap::new(),
+                                                payload_size: 100,
+                                            }
+                                        ];
+                                    }
+                                    #[cfg(not(feature = "capture"))]
+                                    {
+                                        // Show message about needing capture feature
+                                    }
+                                }
+                                KeyCode::Char('t') => {
+                                    app.interceptor_running = false;
+                                    app.interceptor_requests.clear();
+                                }
+                                KeyCode::Char('c') => {
+                                    app.interceptor_requests.clear();
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    app.next(app.interceptor_requests.len());
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    app.previous(app.interceptor_requests.len());
+                                }
+                                _ => {}
+                            },
+                        },
                     InputMode::Editing => match key.code {
                         KeyCode::Enter => {
                             if !app.input.is_empty() {

@@ -1,11 +1,12 @@
 //! # Warp - High Performance Download Accelerator
 //!
-//! Warp is a multithreaded download manager designed to utilize system resources
+//! Warp is a multithreaded download manager designed to use system resources
 //! efficiently while ensuring download integrity through atomic progress tracking
 //! and a heartbeat-based snapshot system.
 
 pub mod ui;
 mod downloader;
+mod interceptor;
 
 use clap::Parser;
 use crate::downloader::cli::{Cli, Commands};
@@ -51,6 +52,18 @@ async fn main() -> Result<(), anyhow::Error> {
         }
         Commands::Gui => {
             ui::gui::run(registry).map_err(|e| anyhow::anyhow!("GUI error: {}", e))?;
+        }
+        Commands::Intercept { interface } => {
+            downloader::cli::handle_intercept(interface).await?;
+        }
+        Commands::InterceptList => {
+            downloader::cli::handle_intercept_list()?;
+        }
+        Commands::InterceptClear => {
+            downloader::cli::handle_intercept_clear()?;
+        }
+        Commands::Example => {
+            downloader::cli::handle_example()?;
         }
     }
 
