@@ -36,10 +36,16 @@ struct App {
     current_tab: Tab,
     interceptor_requests: Vec<crate::interceptor::types::CapturedRequest>,
     interceptor_running: bool,
+    show_npcap_warning: bool,
 }
 
 impl App {
     fn new(backend: UiBackend) -> Self {
+        #[cfg(feature = "capture")]
+        let npcaps_installed = crate::interceptor::npcap_check::check_npcap_installed();
+        #[cfg(not(feature = "capture"))]
+        let npcaps_installed = false;
+
         Self {
             input: String::new(),
             input_mode: InputMode::Normal,
@@ -48,6 +54,7 @@ impl App {
             current_tab: Tab::Downloads,
             interceptor_requests: Vec::new(),
             interceptor_running: false,
+            show_npcap_warning: !npcaps_installed,
         }
     }
 
@@ -156,7 +163,11 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
             let help_msg = match app.input_mode {
                 InputMode::Normal => match app.current_tab {
                     Tab::Downloads => "q: Quit | Tab: Switch View | a: Add | p: Pause | r: Resume | d: Delete | Up/Down: Select",
-                    Tab::Interceptor => "q: Quit | Tab: Switch View | s: Start | t: Stop | c: Clear | Up/Down: Select",
+                    Tab::Interceptor => if app.show_npcap_warning {
+                        "q: Quit | Tab: Switch View | d: Dismiss Warning"
+                    } else {
+                        "q: Quit | Tab: Switch View | s: Start | t: Stop | c: Clear | Up/Down: Select"
+                    },
                 },
                 InputMode::Editing => "Editing Mode: Enter to submit, Esc to cancel",
             };
@@ -278,6 +289,22 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                         .block(status_block);
                     f.render_widget(status_para, chunks[1]);
 
+                    // Show Npcap warning if not installed
+                    if app.show_npcap_warning {
+                        let warning_block = Block::default()
+                            .title(" ⚠️  Npcap Required ")
+                            .borders(Borders::ALL);
+                        let warning_text = vec![
+                            ratatui::prelude::Line::from(Span::styled("Npcap is required for network packet capture.", Style::default().fg(Color::Yellow))),
+                            ratatui::prelude::Line::from("Install from: https://nmap.org/npcap/"),
+                            ratatui::prelude::Line::from(Span::styled("Enable 'WinPcap API-compatible Mode' during installation.", Style::default().fg(Color::Yellow))),
+                            ratatui::prelude::Line::from("Press 'd' to dismiss this warning."),
+                        ];
+                        let warning_para = Paragraph::new(warning_text).block(warning_block);
+                        f.render_widget(warning_para, chunks[2]);
+                        return; // Don't show the table when warning is active
+                    }
+
                     // Render captured requests table
                     let mut rows = Vec::new();
                     for (i, req) in app.interceptor_requests.iter().enumerate() {
@@ -386,31 +413,41 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                                 KeyCode::Tab => {
                                     app.switch_tab();
                                 }
+                                KeyCode::Char('d') => {
+                                    app.show_npcap_warning = false;
+                                }
                                 KeyCode::Char('s') => {
                                     // Start interceptor (placeholder - requires capture feature)
                                     #[cfg(feature = "capture")]
                                     {
-                                        app.interceptor_running = true;
-                                        // Add some example requests for demo
-                                        app.interceptor_requests = vec![
-                                            crate::interceptor::types::CapturedRequest {
-                                                id: "1".to_string(),
-                                                timestamp: 0,
-                                                source_ip: "192.168.1.100".to_string(),
-                                                destination_ip: "example.com".to_string(),
-                                                source_port: 54321,
-                                                destination_port: 443,
-                                                protocol: "TCP".to_string(),
-                                                method: Some("GET".to_string()),
-                                                url: Some("/test".to_string()),
-                                                host: Some("example.com".to_string()),
-                                                user_agent: None,
-                                                content_type: None,
-                                                content_length: None,
-                                                headers: std::collections::HashMap::new(),
-                                                payload_size: 100,
-                                            }
-                                        ];
+                                        use crate::interceptor::npcap_check;
+                                        if npcap_check::check_npcap_installed() {
+                                            app.interceptor_running = true;
+                                            // Add some example requests for demo
+                                            app.interceptor_requests = vec![
+                                                crate::interceptor::types::CapturedRequest {
+                                                    id: "1".to_string(),
+                                                    timestamp: 0,
+                                                    source_ip: "192.168.1.100".to_string(),
+                                                    destination_ip: "example.com".to_string(),
+                                                    source_port: 54321,
+                                                    destination_port: 443,
+                                                    protocol: "TCP".to_string(),
+                                                    method: Some("GET".to_string()),
+                                                    url: Some("/test".to_string()),
+                                                    host: Some("example.com".to_string()),
+                                                    user_agent: None,
+                                                    content_type: None,
+                                                    content_length: None,
+                                                    headers: std::collections::HashMap::new(),
+                                                    payload_size: 100,
+                                                }
+                                            ];
+                                        } else {
+                                            // Npcap not installed - show message via print (TUI limitation)
+                                            // In a real implementation, this would show in the TUI
+                                            app.show_npcap_warning = true;
+                                        }
                                     }
                                     #[cfg(not(feature = "capture"))]
                                     {

@@ -221,7 +221,10 @@ pub fn handle_clean(registry: &mut Registry) -> Result<()> {
 
 #[cfg(feature = "capture")]
 pub async fn handle_intercept(interface: Option<String>) -> Result<()> {
-    use crate::interceptor::{Interceptor, InterceptorConfig};
+    use crate::interceptor::{Interceptor, InterceptorConfig, npcap_check};
+    
+    // Check if Npcap is installed
+    npcap_check::ensure_npcap_or_error()?;
     
     println!("Starting network request interceptor...");
     if let Some(ref iface) = interface {
@@ -273,8 +276,6 @@ pub fn handle_example() -> Result<()> {
 
 #[cfg(feature = "capture")]
 pub fn handle_intercept_list() -> Result<()> {
-    use crate::interceptor::{Interceptor, InterceptorConfig};
-    
     println!("Listing captured requests...\n");
     println!("Note: This shows requests from a running interceptor instance.");
     println!("Start an interceptor with: warp intercept\n");
@@ -294,8 +295,6 @@ pub fn handle_intercept_list() -> Result<()> {
 
 #[cfg(feature = "capture")]
 pub fn handle_intercept_clear() -> Result<()> {
-    use crate::interceptor::{Interceptor, InterceptorConfig};
-    
     println!("Clearing captured requests...");
     println!("Note: This clears requests from a running interceptor instance.\n");
     println!("For now, run the example to see simulated requests:");

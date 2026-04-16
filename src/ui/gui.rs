@@ -34,16 +34,23 @@ struct WarpApp {
     current_tab: GuiTab,
     interceptor_running: bool,
     captured_requests: Vec<crate::interceptor::types::CapturedRequest>,
+    show_npcap_warning: bool,
 }
 
 impl WarpApp {
     fn new(backend: UiBackend) -> Self {
+        #[cfg(feature = "capture")]
+        let npcaps_installed = crate::interceptor::npcap_check::check_npcap_installed();
+        #[cfg(not(feature = "capture"))]
+        let npcaps_installed = false;
+
         Self {
             backend,
             new_url: String::new(),
             current_tab: GuiTab::Downloads,
             interceptor_running: false,
             captured_requests: Vec::new(),
+            show_npcap_warning: !npcaps_installed,
         }
     }
 }
@@ -57,6 +64,42 @@ impl eframe::App for WarpApp {
         let mut style = (*ctx.style()).clone();
         style.visuals = egui::Visuals::dark();
         ctx.set_style(style);
+
+        // Show Npcap warning if not installed
+        if self.show_npcap_warning {
+            egui::Window::new("⚠️ Npcap Required")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::new(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.heading("Network Packet Capture Requires Npcap");
+                    ui.add_space(10.0);
+                    ui.label("Npcap is a library required for capturing network traffic.");
+                    ui.label("It is currently not installed on your system.");
+                    ui.add_space(15.0);
+                    
+                    ui.label("To install Npcap:");
+                    ui.label("1. Download from: https://nmap.org/npcap/");
+                    ui.label(egui::RichText::new("2. During installation, enable 'WinPcap API-compatible Mode'").color(egui::Color32::YELLOW));
+                    ui.label("3. Restart your computer after installation");
+                    ui.add_space(15.0);
+                    
+                    ui.horizontal(|ui| {
+                        if ui.button("🌐 Open Download Page").clicked() {
+                            let _ = std::process::Command::new("cmd")
+                                .args(&["/C", "start", "https://nmap.org/npcap/"])
+                                .spawn();
+                        }
+                        
+                        if ui.button("✓ Dismiss").clicked() {
+                            self.show_npcap_warning = false;
+                        }
+                    });
+                    
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Note: You can still use the app in demo mode without Npcap.").small().color(egui::Color32::LIGHT_GRAY));
+                });
+        }
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.add_space(8.0);
@@ -235,31 +278,46 @@ impl eframe::App for WarpApp {
                             if ui.button("▶ Start").clicked() {
                                 #[cfg(feature = "capture")]
                                 {
-                                    self.interceptor_running = true;
-                                    // Add example request for demo
-                                    self.captured_requests = vec![
-                                        crate::interceptor::types::CapturedRequest {
-                                            id: "1".to_string(),
-                                            timestamp: 0,
-                                            source_ip: "192.168.1.100".to_string(),
-                                            destination_ip: "example.com".to_string(),
-                                            source_port: 54321,
-                                            destination_port: 443,
-                                            protocol: "TCP".to_string(),
-                                            method: Some("GET".to_string()),
-                                            url: Some("/test".to_string()),
-                                            host: Some("example.com".to_string()),
-                                            user_agent: None,
-                                            content_type: None,
-                                            content_length: None,
-                                            headers: std::collections::HashMap::new(),
-                                            payload_size: 100,
-                                        }
-                                    ];
+                                    use crate::interceptor::npcap_check;
+                                    if npcap_check::check_npcap_installed() {
+                                        self.interceptor_running = true;
+                                        // Add example request for demo
+                                        self.captured_requests = vec![
+                                            crate::interceptor::types::CapturedRequest {
+                                                id: "1".to_string(),
+                                                timestamp: 0,
+                                                source_ip: "192.168.1.100".to_string(),
+                                                destination_ip: "example.com".to_string(),
+                                                source_port: 54321,
+                                                destination_port: 443,
+                                                protocol: "TCP".to_string(),
+                                                method: Some("GET".to_string()),
+                                                url: Some("/test".to_string()),
+                                                host: Some("example.com".to_string()),
+                                                user_agent: None,
+                                                content_type: None,
+                                                content_length: None,
+                                                headers: std::collections::HashMap::new(),
+                                                payload_size: 100,
+                                            }
+                                        ];
+                                    } else {
+                                        // Show the warning again
+                                        self.show_npcap_warning = true;
+                                    }
                                 }
                                 #[cfg(not(feature = "capture"))]
                                 {
                                     // Show message about needing capture feature
+                                    egui::Window::new("Feature Required")
+                                        .collapsible(false)
+                                        .resizable(false)
+                                        .show(ctx, |ui| {
+                                            ui.label("Packet capture requires the 'capture' feature.");
+                                            ui.label("Run with: cargo run --features capture -- intercept");
+                                            ui.add_space(8.0);
+                                            ui.label("For now, use: cargo run -- example");
+                                        });
                                 }
                             }
                         }

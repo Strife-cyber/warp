@@ -70,11 +70,13 @@ impl Interceptor {
     }
 
     /// Returns all captured requests
+    #[allow(dead_code)]
     pub async fn get_all_requests(&self) -> Vec<CapturedRequest> {
         self.captured_requests.read().await.clone()
     }
 
     /// Returns captured requests matching the filter
+    #[allow(dead_code)]
     pub async fn get_filtered_requests(&self, filter: RequestFilter) -> Vec<CapturedRequest> {
         let requests = self.captured_requests.read().await;
         requests.iter()
@@ -84,21 +86,25 @@ impl Interceptor {
     }
 
     /// Clears all captured requests
+    #[allow(dead_code)]
     pub async fn clear(&self) {
         self.captured_requests.write().await.clear();
     }
 
     /// Sets the current filter
+    #[allow(dead_code)]
     pub async fn set_filter(&self, filter: RequestFilter) {
         *self.filter.write().await = filter;
     }
 
     /// Returns the number of captured requests
+    #[allow(dead_code)]
     pub async fn count(&self) -> usize {
         self.captured_requests.read().await.len()
     }
 
     /// Returns true if the interceptor is currently running
+    #[allow(dead_code)]
     pub async fn is_running(&self) -> bool {
         *self.is_running.read().await
     }

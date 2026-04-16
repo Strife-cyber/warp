@@ -51,9 +51,17 @@ impl Registry {
         let path = dummy.get_registry_path()?;
         if path.exists() {
             let data = std::fs::read_to_string(&path)?;
-            let mut registry: Registry = serde_json::from_str(&data)?;
-            registry.custom_path = None;
-            Ok(registry)
+            match serde_json::from_str::<Registry>(&data) {
+                Ok(mut registry) => {
+                    registry.custom_path = None;
+                    Ok(registry)
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to parse registry file at {}: {}", path.display(), e);
+                    eprintln!("Creating a new empty registry...");
+                    Ok(Registry::default())
+                }
+            }
         } else {
             Ok(Registry::default())
         }

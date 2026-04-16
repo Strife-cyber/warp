@@ -7,6 +7,7 @@ pub mod types;
 pub mod filter;
 pub mod signal;
 pub mod example;
+pub mod npcap_check;
 
 #[cfg(feature = "capture")]
 pub mod parser;
@@ -18,11 +19,12 @@ pub mod capture;
 pub mod interceptor;
 
 // Re-export commonly used types for convenience
-pub use types::{CapturedRequest, RequestFilter, InterceptorConfig};
+pub use types::CapturedRequest;
 
 #[cfg(feature = "capture")]
 pub use interceptor::Interceptor;
 
+#[allow(dead_code)]
 /// Handles a request (can be called externally to manually add requests)
 pub async fn handle_request(req: CapturedRequest) -> anyhow::Result<()> {
     println!("[REQUEST] {} {} from {}:{} to {}:{}",

@@ -32,23 +32,15 @@ pub struct RequestFilter {
 }
 
 /// Configuration for the interceptor
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct InterceptorConfig {
     pub interface_name: Option<String>,
     pub promiscuous: bool,
     pub snaplen: i32,
     pub timeout: i32,
+    #[allow(dead_code)]
     pub buffer_size: usize,
-}
-
-impl Default for InterceptorConfig {
-    fn default() -> Self {
-        Self {
-            interface_name: None,
-            promiscuous: true,
-            snaplen: 65535,
-            timeout: 1000,
-            buffer_size: 10000,
-        }
-    }
+    #[allow(dead_code)]
+    pub filter: Option<RequestFilter>,
 }
