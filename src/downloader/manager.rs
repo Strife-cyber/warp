@@ -19,11 +19,13 @@ pub struct Metadata {
     pub active_chunks: Mutex<Vec<Arc<Chunk>>>,
     /// A list of chunks that have COMPLETELY finished downloading.
     pub completed_chunks: Mutex<Vec<Arc<Chunk>>>,
+    /// Optional limit on download speed (bytes per second)
+    pub max_speed_bytes: Option<u64>,
 }
 
 impl Metadata {
     /// Creates fresh metadata for a new download.
-    pub fn new(url: String, size: u64) -> Self {
+    pub fn new(url: String, size: u64, max_speed_bytes: Option<u64>) -> Self {
         let mut chunks = VecDeque::new();
         chunks.push_back(Arc::new(Chunk::new(0..=(size - 1), 0)));
 
@@ -33,6 +35,7 @@ impl Metadata {
             chunks: Mutex::new(chunks),
             active_chunks: Mutex::new(Vec::new()),
             completed_chunks: Mutex::new(Vec::new()),
+            max_speed_bytes,
         }
     }
 
@@ -93,26 +96,36 @@ impl Manager {
         Ok(size)
     }
 
-    /// Initializes a Manager, automatically attempting to resume from a .warp file if it exists.
-    pub async fn from_url(url: String, target_path: std::path::PathBuf) -> Result<Self, anyhow::Error> {
-        let warp_path = target_path.with_extension("warp");
-        let client = Arc::new(reqwest::Client::new());
+    /// Initializes a Manager from a DownloadEntry, automatically attempting to resume.
+    pub async fn from_entry(entry: &super::registry::DownloadEntry) -> Result<Self, anyhow::Error> {
+        let warp_path = entry.target_path.with_extension("warp");
+        
+        let mut client_builder = reqwest::Client::builder();
+        if let Some(ref proxy_url) = entry.proxy {
+            if let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
+                client_builder = client_builder.proxy(proxy);
+            }
+        }
+        let client = Arc::new(client_builder.build()?);
 
         let metadata = if warp_path.exists() {
             match super::beat::load_snapshot(&warp_path).await {
-                Ok(m) => m,
+                Ok(mut m) => {
+                    m.max_speed_bytes = entry.max_speed_bytes;
+                    m
+                },
                 Err(e) => {
-                    eprintln!("Failed to load snapshot for {}: {}. Starting fresh.", target_path.display(), e);
-                    let size = Self::fetch_content_length(&client, &url).await?;
-                    Metadata::new(url, size) 
+                    eprintln!("Failed to load snapshot for {}: {}. Starting fresh.", entry.target_path.display(), e);
+                    let size = Self::fetch_content_length(&client, &entry.url).await?;
+                    Metadata::new(entry.url.clone(), size, entry.max_speed_bytes) 
                 }
             }
         } else {
-            let size = Self::fetch_content_length(&client, &url).await?;
-            Metadata::new(url, size) 
+            let size = Self::fetch_content_length(&client, &entry.url).await?;
+            Metadata::new(entry.url.clone(), size, entry.max_speed_bytes) 
         };
 
-        Ok(Self::new(metadata, target_path, client))
+        Ok(Self::new(metadata, entry.target_path.clone(), client))
     }
 
     pub fn new(metadata: Metadata, target_path: std::path::PathBuf, client: Arc<reqwest::Client>) -> Self {
@@ -227,7 +240,8 @@ impl Manager {
 
                 workers.spawn(async move {
                     let _permit = _permit;
-                    let res = download_worker(client, path, chunk, url, token).await;
+                    let speed = meta.max_speed_bytes;
+                    let res = download_worker(client, path, chunk, url, token, speed).await;
 
                     // Transition chunk based on result
                     let c_opt = {
@@ -340,7 +354,7 @@ mod tests {
     async fn test_metadata_new() {
         let url = "http://example.com".to_string();
         let size = 1000;
-        let metadata = Metadata::new(url.clone(), size);
+        let metadata = Metadata::new(url.clone(), size, None);
         assert_eq!(metadata.url, url);
         assert_eq!(metadata.size, size);
         let chunks = metadata.chunks.lock().await;
@@ -353,21 +367,25 @@ mod tests {
         let target_path = dir.path().join("download.zip");
         let warp_path = target_path.with_extension("warp");
 
-        let metadata = Metadata::new("http://test.com".to_string(), 5000);
+        let metadata = Metadata::new("http://test.com".to_string(), 5000, None);
         {
             let chunks = metadata.chunks.lock().await;
             chunks[0].progress.store(2500, Ordering::SeqCst);
         }
         super::super::beat::save_snapshot_sync(&metadata, &warp_path).await.unwrap();
 
-        let manager = Manager::from_url("http://test.com".to_string(), target_path).await.unwrap();
+        let mut registry = crate::downloader::registry::Registry::default();
+        let id = registry.add("http://test.com".to_string(), target_path.clone());
+        let entry = registry.downloads.get(&id).unwrap();
+
+        let manager = Manager::from_entry(entry).await.unwrap();
         assert_eq!(manager.metadata.total_progress().await, 2500);
     }
 
     #[tokio::test]
     async fn test_total_progress_with_completed_chunks() {
         let size = 1000;
-        let metadata = Metadata::new("url".to_string(), size);
+        let metadata = Metadata::new("url".to_string(), size, None);
         
         // 1. Initial progress is 0
         assert_eq!(metadata.total_progress().await, 0);
@@ -402,7 +420,7 @@ mod tests {
     async fn test_worker_failure_requeue() {
         let dir = tempdir().unwrap();
         let target_path = dir.path().join("test.bin");
-        let metadata = Metadata::new("url".to_string(), 1000);
+        let metadata = Metadata::new("url".to_string(), 1000, None);
         let manager = Manager::new(metadata, target_path, Arc::new(reqwest::Client::new()));
         
         let chunk = {

@@ -27,6 +27,8 @@ pub struct RequestFilter {
     pub domain: Option<String>,
     pub method: Option<String>,
     pub content_type: Option<String>,
+    pub url_regex: Option<String>,
+    pub content_type_regex: Option<String>,
     pub min_size: Option<usize>,
     pub max_size: Option<usize>,
 }

@@ -102,10 +102,10 @@ impl UiBackend {
                                 }
                             }
                             UiMessage::Resume(id) => {
-                                let (url, target_path) = {
+                                let entry_clone = {
                                     if let Some(entry) = registry.downloads.get_mut(&id) {
                                         entry.status = DownloadStatus::Downloading;
-                                        (entry.url.clone(), entry.target_path.clone())
+                                        entry.clone()
                                     } else {
                                         continue;
                                     }
@@ -117,53 +117,53 @@ impl UiBackend {
                                 }
 
                                 let id_clone = id.clone();
-                                    let sem_clone = Arc::clone(&semaphore);
-                                    let state_for_task = Arc::clone(&state_clone);
+                                let sem_clone = Arc::clone(&semaphore);
+                                let state_for_task = Arc::clone(&state_clone);
 
-                                    active_downloads.spawn(async move {
-                                        let result = Manager::from_url(url.clone(), target_path.clone()).await;
-                                        match result {
-                                            Ok(mut manager) => {
-                                                let meta = Arc::clone(&manager.metadata);
-                                                let size = meta.size;
-                                                let task_token = manager.cancel_token.clone();
-                                                
-                                                {
-                                                    if let Some(p) = state_for_task.write().unwrap().get_mut(&id_clone) {
-                                                        p.total = size;
+                                active_downloads.spawn(async move {
+                                    let result = Manager::from_entry(&entry_clone).await;
+                                    match result {
+                                        Ok(mut manager) => {
+                                            let meta = Arc::clone(&manager.metadata);
+                                            let size = meta.size;
+                                            let task_token = manager.cancel_token.clone();
+                                            
+                                            {
+                                                if let Some(p) = state_for_task.write().unwrap().get_mut(&id_clone) {
+                                                    p.total = size;
+                                                }
+                                            }
+
+                                            // Progress poller
+                                            let poller_token = task_token.clone();
+                                            let poller_meta = Arc::clone(&meta);
+                                            let poller_state = Arc::clone(&state_for_task);
+                                            let poller_id = id_clone.clone();
+                                            tokio::spawn(async move {
+                                                let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
+                                                let mut last_prog = poller_meta.total_progress().await;
+                                                loop {
+                                                    tokio::select! {
+                                                        _ = interval.tick() => {
+                                                            let prog = poller_meta.total_progress().await;
+                                                            if let Some(p) = poller_state.write().unwrap().get_mut(&poller_id) {
+                                                                let delta = prog.saturating_sub(last_prog);
+                                                                p.speed = delta * 2;
+                                                                p.downloaded = prog;
+                                                            }
+                                                            last_prog = prog;
+                                                        }
+                                                        _ = poller_token.cancelled() => break,
                                                     }
                                                 }
+                                            });
 
-                                                // Progress poller
-                                                let poller_token = task_token.clone();
-                                                let poller_meta = Arc::clone(&meta);
-                                                let poller_state = Arc::clone(&state_for_task);
-                                                let poller_id = id_clone.clone();
-                                                tokio::spawn(async move {
-                                                    let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
-                                                    let mut last_prog = poller_meta.total_progress().await;
-                                                    loop {
-                                                        tokio::select! {
-                                                            _ = interval.tick() => {
-                                                                let prog = poller_meta.total_progress().await;
-                                                                if let Some(p) = poller_state.write().unwrap().get_mut(&poller_id) {
-                                                                    let delta = prog.saturating_sub(last_prog);
-                                                                    p.speed = delta * 2;
-                                                                    p.downloaded = prog;
-                                                                }
-                                                                last_prog = prog;
-                                                            }
-                                                            _ = poller_token.cancelled() => break,
-                                                        }
-                                                    }
-                                                });
-
-                                                let res = manager.run(worker_limit, sem_clone).await;
-                                                (id_clone, task_token, res.map(|_| DownloadStatus::Completed).map_err(|e| e.to_string()))
-                                            }
-                                            Err(e) => (id_clone, tokio_util::sync::CancellationToken::new(), Err(e.to_string())),
+                                            let res: Result<(), anyhow::Error> = manager.run(worker_limit, sem_clone).await;
+                                            (id_clone, task_token, res.map(|_| DownloadStatus::Completed).map_err(|e| e.to_string()))
                                         }
-                                    });
+                                        Err(e) => (id_clone, tokio_util::sync::CancellationToken::new(), Err(e.to_string())),
+                                    }
+                                });
                             }
                             UiMessage::Remove(id) => {
                                 if let Some(token) = tokens.remove(&id) {

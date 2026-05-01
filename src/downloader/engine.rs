@@ -19,15 +19,18 @@ pub async fn run_all(registry: &mut Registry) -> Result<()> {
     let mut managers = JoinSet::new();
     let multi_progress = MultiProgress::new();
 
-    // Find all incomplete downloads
-    for (id, entry) in registry.downloads.iter_mut() {
-        if entry.status == DownloadStatus::Completed {
-            continue;
+    // Find all incomplete downloads and sort by priority (descending)
+    let mut pending_downloads = Vec::new();
+    for (id, entry) in registry.downloads.iter() {
+        if entry.status != DownloadStatus::Completed {
+            pending_downloads.push((id.clone(), entry.clone()));
         }
+    }
+    
+    // Sort by priority, highest first
+    pending_downloads.sort_by(|a, b| b.1.priority.cmp(&a.1.priority));
 
-        let url = entry.url.clone();
-        let target_path = entry.target_path.clone();
-        let id_clone = id.clone();
+    for (id_clone, entry) in pending_downloads {
         let sem_clone = Arc::clone(&semaphore);
         
         let pb = multi_progress.add(ProgressBar::new(0));
@@ -36,16 +39,38 @@ pub async fn run_all(registry: &mut Registry) -> Result<()> {
             .progress_chars("#>-"));
         
         // Transition state to downloading
-        entry.status = DownloadStatus::Downloading;
+        registry.update_status(&id_clone, DownloadStatus::Downloading);
 
         // Spawn a task for each manager
         managers.spawn(async move {
-            match Manager::from_url(url, target_path).await {
+            match Manager::from_entry(&entry).await {
                 Ok(mut manager) => {
                     pb.set_length(manager.metadata.size);
-                    manager.set_progress_bar(pb);
+                    manager.set_progress_bar(pb.clone());
                     match manager.run(suggested_workers, sem_clone).await {
-                        Ok(_) => Ok((id_clone, DownloadStatus::Completed)),
+                        Ok(_) => {
+                            // Checksum verification
+                            if let Some(expected_hash) = &entry.checksum {
+                                pb.set_message("Verifying checksum...");
+                                use sha2::{Sha256, Digest};
+                                use hex::encode;
+                                
+                                match tokio::fs::read(&entry.target_path).await {
+                                    Ok(bytes) => {
+                                        let mut hasher = Sha256::new();
+                                        hasher.update(&bytes);
+                                        let result = hasher.finalize();
+                                        let hash_hex = encode(result);
+                                        if hash_hex.to_lowercase() != expected_hash.to_lowercase() {
+                                            return Err((id_clone, format!("Checksum mismatch! Expected: {}, Got: {}", expected_hash, hash_hex)));
+                                        }
+                                        pb.set_message("Checksum OK");
+                                    }
+                                    Err(e) => return Err((id_clone, format!("Failed to read file for checksum: {}", e))),
+                                }
+                            }
+                            Ok((id_clone, DownloadStatus::Completed))
+                        },
                         Err(e) => Err((id_clone, e.to_string())),
                     }
                 }

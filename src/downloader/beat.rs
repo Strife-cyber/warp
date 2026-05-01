@@ -80,6 +80,7 @@ pub async fn load_snapshot(target_path: &Path) -> Result<Metadata, anyhow::Error
         chunks: tokio::sync::Mutex::new(chunks),
         active_chunks: tokio::sync::Mutex::new(Vec::new()),
         completed_chunks: tokio::sync::Mutex::new(Vec::new()),
+        max_speed_bytes: None,
     })
 }
 
@@ -176,7 +177,7 @@ mod tests {
         let warp_path = dir.path().join("test.warp");
 
         // 1. Create initial metadata and simulate some progress.
-        let metadata = Metadata::new("http://test.com".to_string(), 1000);
+        let metadata = Metadata::new("http://test.com".to_string(), 1000, None);
         {
             let chunks = metadata.chunks.lock().await;
             chunks[0].progress.store(500, Ordering::SeqCst);
@@ -204,7 +205,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_snapshot_sync() {
-        let metadata = Metadata::new("url".to_string(), 1000);
+        let metadata = Metadata::new("url".to_string(), 1000, None);
         let snapshot = create_snapshot_sync(&metadata).await;
         
         assert_eq!(snapshot.url, "url");

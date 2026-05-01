@@ -1,4 +1,5 @@
 use crate::interceptor::types::{CapturedRequest, RequestFilter};
+use regex::Regex;
 
 /// Checks if a request matches the filter
 pub fn matches_filter(request: &CapturedRequest, filter: &RequestFilter) -> bool {
@@ -21,6 +22,30 @@ pub fn matches_filter(request: &CapturedRequest, filter: &RequestFilter) -> bool
     if let Some(content_type) = &filter.content_type {
         if request.content_type.as_ref().map(|ct| !ct.contains(content_type)).unwrap_or(true) {
             return false;
+        }
+    }
+    
+    if let Some(regex_str) = &filter.url_regex {
+        if let Ok(re) = Regex::new(regex_str) {
+            if let Some(url) = &request.url {
+                if !re.is_match(url) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+
+    if let Some(regex_str) = &filter.content_type_regex {
+        if let Ok(re) = Regex::new(regex_str) {
+            if let Some(ct) = &request.content_type {
+                if !re.is_match(ct) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
         }
     }
 

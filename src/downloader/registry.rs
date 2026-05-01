@@ -19,6 +19,14 @@ pub struct DownloadEntry {
     pub url: String,
     pub target_path: PathBuf,
     pub status: DownloadStatus,
+    #[serde(default)]
+    pub priority: u8,
+    #[serde(default)]
+    pub proxy: Option<String>,
+    #[serde(default)]
+    pub checksum: Option<String>,
+    #[serde(default)]
+    pub max_speed_bytes: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -89,6 +97,10 @@ impl Registry {
             url,
             target_path,
             status: DownloadStatus::Pending,
+            priority: 0,
+            proxy: None,
+            checksum: None,
+            max_speed_bytes: None,
         };
         
         self.downloads.insert(id.clone(), entry);
@@ -104,6 +116,16 @@ impl Registry {
     pub fn update_status(&mut self, id: &str, status: DownloadStatus) {
         if let Some(entry) = self.downloads.get_mut(id) {
             entry.status = status;
+        }
+    }
+
+    /// Updates advanced configuration for a download
+    pub fn update_advanced(&mut self, id: &str, priority: Option<u8>, proxy: Option<String>, checksum: Option<String>, max_speed_bytes: Option<u64>) {
+        if let Some(entry) = self.downloads.get_mut(id) {
+            if let Some(p) = priority { entry.priority = p; }
+            if proxy.is_some() { entry.proxy = proxy; }
+            if checksum.is_some() { entry.checksum = checksum; }
+            if max_speed_bytes.is_some() { entry.max_speed_bytes = max_speed_bytes; }
         }
     }
 

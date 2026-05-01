@@ -100,6 +100,7 @@ pub async fn download_worker(
     chunk: Arc<Chunk>,
     url: String,
     cancel_token: CancellationToken,
+    max_speed_bytes: Option<u64>,
 ) -> Result<(), anyhow::Error> {
     // Open a private handle for this worker to allow concurrent writes without locking
     let mut handle = tokio::fs::OpenOptions::new()
@@ -112,7 +113,7 @@ pub async fn download_worker(
             // Respect global cancellation from the Manager
             _ = cancel_token.cancelled() => return Ok(()),
             // Execute the actual download loop
-            res = perform_download(&client, &mut handle, &chunk, &url) => {
+            res = perform_download(&client, &mut handle, &chunk, &url, max_speed_bytes) => {
                 return match res {
                     Ok(()) => Ok(()),
                     Err(e) => {
@@ -135,6 +136,7 @@ async fn perform_download(
     handle: &mut tokio::fs::File,
     chunk: &Chunk,
     url: &str,
+    max_speed_bytes: Option<u64>,
 ) -> Result<(), anyhow::Error> {
     let mut retry_count = 0;
     let max_retries = 5;
@@ -189,6 +191,9 @@ async fn perform_download(
 
         // 3. Process the byte stream
         let mut stream = response.bytes_stream();
+        let start_time = std::time::Instant::now();
+        let mut bytes_since_start = 0;
+
         while let Some(item) = stream.next().await {
             let packet = match item {
                 Ok(p) => p,
@@ -222,6 +227,22 @@ async fn perform_download(
 
             handle.write_all(&packet[..bytes_to_write]).await?;
             chunk.progress.fetch_add(bytes_to_write as u64, Ordering::SeqCst);
+            bytes_since_start += bytes_to_write as u64;
+
+            // Optional Throttling
+            if let Some(limit) = max_speed_bytes {
+                let elapsed = start_time.elapsed().as_secs_f64();
+                if elapsed > 0.0 {
+                    let current_speed = (bytes_since_start as f64) / elapsed;
+                    if current_speed > limit as f64 {
+                        let target_time = (bytes_since_start as f64) / (limit as f64);
+                        let sleep_time = target_time - elapsed;
+                        if sleep_time > 0.01 { // Only sleep if > 10ms
+                            tokio::time::sleep(Duration::from_secs_f64(sleep_time)).await;
+                        }
+                    }
+                }
+            }
             
             if bytes_to_write < packet.len() {
                 return Ok(());
