@@ -221,7 +221,8 @@ pub fn handle_clean(registry: &mut Registry) -> Result<()> {
 
 #[cfg(feature = "capture")]
 pub async fn handle_intercept(interface: Option<String>) -> Result<()> {
-    use crate::interceptor::{Interceptor, InterceptorConfig, npcap_check};
+    use crate::interceptor::types::InterceptorConfig;
+    use crate::interceptor::{Interceptor, npcap_check};
     
     // Check if Npcap is installed
     npcap_check::ensure_npcap_or_error()?;
