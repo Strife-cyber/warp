@@ -181,29 +181,40 @@ impl Manager {
         let mut workers = JoinSet::new();
 
         loop {
-            // CRITICAL: We only lock the queue to decide what to do next, then drop it immediately.
-            let mut queue = self.metadata.chunks.lock().await;
+            let mut chunk_to_spawn = None;
+            let mut permit = None;
 
-            // Cleanup phase
-            while let Some(front) = queue.front() {
-                if front.remaining_bytes().await == 0 {
-                    let chunk = queue.pop_front().unwrap();
-                    self.metadata.completed_chunks.lock().await.push(chunk);
-                } else {
-                    break;
+            {
+                let mut queue = self.metadata.chunks.lock().await;
+
+                // Cleanup phase
+                while let Some(front) = queue.front() {
+                    if front.remaining_bytes().await == 0 {
+                        let chunk = queue.pop_front().unwrap();
+                        self.metadata.completed_chunks.lock().await.push(chunk);
+                    } else {
+                        break;
+                    }
                 }
-            }
 
-            if queue.is_empty() {
-                if let Some(new_chunk) = self.try_steal_work().await {
-                    queue.push_back(new_chunk);
-                } else if workers.is_empty() {
-                    break; 
+                if queue.is_empty() {
+                    if let Some(new_chunk) = self.try_steal_work().await {
+                        queue.push_back(new_chunk);
+                    } else if workers.is_empty() {
+                        break; 
+                    }
                 }
-            }
 
-            if let Some(chunk) = queue.pop_front() {
-                let permit = semaphore.clone().acquire_owned().await?;
+                if !queue.is_empty() {
+                    if let Ok(p) = semaphore.clone().try_acquire_owned() {
+                        chunk_to_spawn = queue.pop_front();
+                        permit = Some(p);
+                    }
+                }
+            } // Lock is explicitly dropped here
+
+            if let Some(chunk) = chunk_to_spawn {
+                let _permit = permit.unwrap();
                 let client = Arc::clone(&self.client);
                 let path = self.target_path.clone();
                 let url = self.metadata.url.clone();
@@ -215,13 +226,20 @@ impl Manager {
                 meta.active_chunks.lock().await.push(Arc::clone(&chunk));
 
                 workers.spawn(async move {
-                    let _permit = permit;
+                    let _permit = _permit;
                     let res = download_worker(client, path, chunk, url, token).await;
 
                     // Transition chunk based on result
-                    let mut active = meta.active_chunks.lock().await;
-                    if let Some(pos) = active.iter().position(|c| Arc::ptr_eq(c, &chunk_clone)) {
-                        let c = active.remove(pos);
+                    let c_opt = {
+                        let mut active = meta.active_chunks.lock().await;
+                        if let Some(pos) = active.iter().position(|c| Arc::ptr_eq(c, &chunk_clone)) {
+                            Some(active.remove(pos))
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(c) = c_opt {
                         if res.is_ok() {
                             meta.completed_chunks.lock().await.push(c);
                         } else {
@@ -231,10 +249,10 @@ impl Manager {
 
                     res
                 });
+                
+                // Continue loop immediately to spawn more workers if work and permits exist
+                continue;
             }
-
-            // Drop the lock explicitly before select! to avoid starvation
-            drop(queue);
 
             tokio::select! {
                 result = workers.join_next(), if !workers.is_empty() => {
