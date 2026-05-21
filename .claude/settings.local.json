@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(Get-ChildItem *)",
-      "Bash(cargo build *)"
+      "Bash(cargo build *)",
+      "Bash(Select-String -Pattern \"warning\")",
+      "Bash(cargo test *)",
+      "Bash(cargo run *)",
+      "Bash(cargo clippy *)"
     ]
   }
 }

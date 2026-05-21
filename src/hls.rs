@@ -32,7 +32,7 @@ pub async fn download_hls(
         .await
         .context("Failed to read playlist body")?;
 
-    let playlist = m3u8_rs::parse_playlist_res(&playlist_body.as_bytes())
+    let playlist = m3u8_rs::parse_playlist_res(playlist_body.as_bytes())
         .map_err(|e| anyhow::anyhow!("Failed to parse M3U8 playlist: {:?}", e))?;
 
     let (base_url, segment_urls) = match playlist {
@@ -60,7 +60,7 @@ pub async fn download_hls(
                 uri if uri.starts_with("http") => uri.clone(),
                 _ => {
                     // Resolve relative URL against playlist base
-                    let base = playlist_url.trim_end_matches(|c| c == '/')
+                    let base = playlist_url.trim_end_matches('/')
                         .rsplit_once('/')
                         .map(|(base, _)| base)
                         .unwrap_or(playlist_url);
@@ -85,7 +85,7 @@ pub async fn download_hls(
                 .await
                 .context("Failed to read media playlist body")?;
 
-            let media_playlist = match m3u8_rs::parse_playlist_res(&media_body.as_bytes())
+            let media_playlist = match m3u8_rs::parse_playlist_res(media_body.as_bytes())
                 .map_err(|e| anyhow::anyhow!("Failed to parse media playlist: {:?}", e))?
             {
                 m3u8_rs::Playlist::MediaPlaylist(m) => m,
@@ -101,7 +101,7 @@ pub async fn download_hls(
                         uri.clone()
                     } else {
                         let base = variant_url
-                            .trim_end_matches(|c| c == '/')
+                            .trim_end_matches('/')
                             .rsplit_once('/')
                             .map(|(base, _)| base)
                             .unwrap_or(&variant_url);
@@ -111,7 +111,7 @@ pub async fn download_hls(
                 .collect();
 
             let base = playlist_url
-                .trim_end_matches(|c| c == '/')
+                .trim_end_matches('/')
                 .rsplit_once('/')
                 .map(|(base, _)| base)
                 .unwrap_or(playlist_url);
@@ -129,7 +129,7 @@ pub async fn download_hls(
                         uri.clone()
                     } else {
                         let base = playlist_url
-                            .trim_end_matches(|c| c == '/')
+                            .trim_end_matches('/')
                             .rsplit_once('/')
                             .map(|(base, _)| base)
                             .unwrap_or(playlist_url);
@@ -139,7 +139,7 @@ pub async fn download_hls(
                 .collect();
 
             let base = playlist_url
-                .trim_end_matches(|c| c == '/')
+                .trim_end_matches('/')
                 .rsplit_once('/')
                 .map(|(base, _)| base)
                 .unwrap_or(playlist_url);

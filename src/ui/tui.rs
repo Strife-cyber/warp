@@ -239,9 +239,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
             }
         })?;
 
-        if event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == event::KeyEventKind::Press {
+        if event::poll(std::time::Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+                && key.kind == event::KeyEventKind::Press {
                     let state = app.backend.state.read().unwrap();
                     let mut items: Vec<String> = state.keys().cloned().collect();
                     items.sort();
@@ -282,11 +282,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                             KeyCode::Char('d') => {
                                 if let Some(id) = selected_id {
                                     let _ = app.backend.tx.try_send(UiMessage::Remove(id));
-                                    if let Some(idx) = app.table_state.selected() {
-                                        if idx >= item_count.saturating_sub(1) && idx > 0 {
+                                    if let Some(idx) = app.table_state.selected()
+                                        && idx >= item_count.saturating_sub(1) && idx > 0 {
                                             app.table_state.select(Some(idx - 1));
                                         }
-                                    }
                                 }
                             }
                             _ => {}
@@ -295,7 +294,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                             KeyCode::Enter => {
                                 if !app.input.is_empty() {
                                     let url = app.input.clone();
-                                    let filename = url.split('/').last().unwrap_or("download.bin")
+                                    let filename = url.split('/').next_back().unwrap_or("download.bin")
                                         .split('?').next().unwrap_or("download.bin").to_string();
 
                                     let _ = app.backend.tx.try_send(UiMessage::Add(url, PathBuf::from(filename)));
@@ -316,7 +315,5 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                         },
                     }
                 }
-            }
-        }
     }
 }

@@ -101,11 +101,10 @@ impl Manager {
         let warp_path = entry.target_path.with_extension("warp");
         
         let mut client_builder = reqwest::Client::builder();
-        if let Some(ref proxy_url) = entry.proxy {
-            if let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
+        if let Some(ref proxy_url) = entry.proxy
+            && let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
                 client_builder = client_builder.proxy(proxy);
             }
-        }
         let client = Arc::new(client_builder.build()?);
 
         let metadata = if warp_path.exists() {
@@ -218,12 +217,11 @@ impl Manager {
                     }
                 }
 
-                if !queue.is_empty() {
-                    if let Ok(p) = semaphore.clone().try_acquire_owned() {
+                if !queue.is_empty()
+                    && let Ok(p) = semaphore.clone().try_acquire_owned() {
                         chunk_to_spawn = queue.pop_front();
                         permit = Some(p);
                     }
-                }
             } // Lock is explicitly dropped here
 
             if let Some(chunk) = chunk_to_spawn {
@@ -246,11 +244,7 @@ impl Manager {
                     // Transition chunk based on result
                     let c_opt = {
                         let mut active = meta.active_chunks.lock().await;
-                        if let Some(pos) = active.iter().position(|c| Arc::ptr_eq(c, &chunk_clone)) {
-                            Some(active.remove(pos))
-                        } else {
-                            None
-                        }
+                        active.iter().position(|c| Arc::ptr_eq(c, &chunk_clone)).map(|pos| active.remove(pos))
                     };
 
                     if let Some(c) = c_opt {

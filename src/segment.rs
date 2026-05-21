@@ -46,7 +46,7 @@ impl Chunk {
         let limits = self.chunk_limits.lock().await;
         let total_size = (*limits.end() - *limits.start()) + 1;
         let p = self.progress.load(Ordering::SeqCst);
-        if p >= total_size { 0 } else { total_size - p }
+        total_size.saturating_sub(p)
     }
 
     /// Attempts to split the remaining work of this chunk into two separate chunks.
@@ -63,7 +63,7 @@ impl Chunk {
         let total_size = (current_end - current_start) + 1;
         let current_progress = self.progress.load(Ordering::SeqCst);
         
-        let remaining = if current_progress >= total_size { 0 } else { total_size - current_progress };
+        let remaining = total_size.saturating_sub(current_progress);
         
         if remaining < MIN_SPLIT_SIZE * 2 {
             return None;
@@ -108,22 +108,9 @@ pub async fn download_worker(
         .open(&target_path)
         .await?;
 
-    loop {
-        tokio::select! {
-            // Respect global cancellation from the Manager
-            _ = cancel_token.cancelled() => return Ok(()),
-            // Execute the actual download loop
-            res = perform_download(&client, &mut handle, &chunk, &url, max_speed_bytes) => {
-                return match res {
-                    Ok(()) => Ok(()),
-                    Err(e) => {
-                        // In this implementation, errors cause the worker to fail, 
-                        // letting the manager decide whether to re-assign or stop.
-                        Err(e)
-                    }
-                }
-            }
-        }
+    tokio::select! {
+        _ = cancel_token.cancelled() => Ok(()),
+        res = perform_download(&client, &mut handle, &chunk, &url, max_speed_bytes) => res,
     }
 }
 
@@ -251,7 +238,7 @@ async fn perform_download(
         
         let final_progress = chunk.progress.load(Ordering::SeqCst);
         let final_limits = chunk.chunk_limits.lock().await;
-        if final_progress >= (*final_limits.end() - *final_limits.start()) + 1 {
+        if final_progress > (*final_limits.end() - *final_limits.start()) {
             return Ok(());
         }
     }

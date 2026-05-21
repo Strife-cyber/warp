@@ -110,7 +110,7 @@ pub async fn handle_add(
     let target_path = match output {
         Some(p) => p,
         None => {
-            let filename = url.split('/').last().unwrap_or("download.bin");
+            let filename = url.split('/').next_back().unwrap_or("download.bin");
             let filename = filename.split('?').next().unwrap_or("download.bin");
             PathBuf::from(filename)
         }
@@ -269,8 +269,6 @@ pub fn handle_clean(registry: &mut Registry) -> Result<()> {
 mod tests {
     use super::*;
 
-    use super::*;
-
     fn empty_registry() -> Registry {
         Registry::default()
     }
@@ -296,7 +294,7 @@ mod tests {
         assert_eq!(entry.target_path, path);
     }
 
-    #[tokio::test]
+    #[test]
     fn test_parse_speed_limit() {
         assert_eq!(parse_speed_limit("1M").unwrap(), 1024 * 1024);
         assert_eq!(parse_speed_limit("500K").unwrap(), 500 * 1024);
