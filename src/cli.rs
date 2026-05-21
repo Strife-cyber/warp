@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::path::PathBuf;
-use super::registry::Registry;
+use crate::registry::Registry;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -19,6 +19,18 @@ pub enum Commands {
         /// The optional target file path
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Speed limit (e.g. 1M for 1 MB/s, 500K for 500 KB/s)
+        #[arg(long)]
+        speed_limit: Option<String>,
+        /// Proxy URL (e.g. http://proxy:8080)
+        #[arg(long)]
+        proxy: Option<String>,
+        /// SHA-256 checksum for verification after download
+        #[arg(long)]
+        checksum: Option<String>,
+        /// Priority (0-255, higher = sooner)
+        #[arg(long, default_value_t = 0)]
+        priority: u8,
     },
     /// Lists all known downloads
     List,
@@ -29,7 +41,7 @@ pub enum Commands {
     },
     /// Runs all pending or paused downloads in the foreground
     Run,
-    /// Inspects the .warp snapshot file for a download (converts binary to TOML)
+    /// Inspects the .warp snapshot file for a download
     Inspect {
         /// The ID of the download to inspect
         id: String,
@@ -51,25 +63,50 @@ pub enum Commands {
     },
     /// Removes all completed downloads from the registry
     Clean,
-    /// Launches the interactive Terminal UI (Power User mode)
+    /// Launches the interactive Terminal UI
     Tui,
-    /// Launches the Graphical Desktop UI (Simple User mode)
-    Gui,
-    /// Starts network request interceptor (captures all HTTP/HTTPS traffic)
-    Intercept {
-        /// Optional network interface name (auto-detects if not specified)
+    /// Downloads an HLS (M3U8) video stream
+    M3u8 {
+        /// The M3U8 playlist URL
+        url: String,
+        /// Output file path (.ts)
         #[arg(short, long)]
-        interface: Option<String>,
+        output: Option<PathBuf>,
+        /// Quality variant: best, high, med, low, or index number
+        #[arg(long, default_value = "best")]
+        quality: String,
+        /// Number of concurrent segment downloads
+        #[arg(long, default_value_t = 8)]
+        concurrent: usize,
     },
-    /// Lists captured network requests
-    InterceptList,
-    /// Clears captured network requests
-    InterceptClear,
-    /// Runs interceptor example/simulation (tests without requiring Npcap)
-    Example,
 }
 
-pub async fn handle_add(url: String, output: Option<PathBuf>, registry: &mut Registry) -> Result<()> {
+fn parse_speed_limit(input: &str) -> Result<u64> {
+    let input = input.trim().to_uppercase();
+    if let Some(val) = input.strip_suffix("K") {
+        let num: f64 = val.parse()?;
+        Ok((num * 1024.0) as u64)
+    } else if let Some(val) = input.strip_suffix("M") {
+        let num: f64 = val.parse()?;
+        Ok((num * 1024.0 * 1024.0) as u64)
+    } else if let Some(val) = input.strip_suffix("G") {
+        let num: f64 = val.parse()?;
+        Ok((num * 1024.0 * 1024.0 * 1024.0) as u64)
+    } else {
+        let num: u64 = input.parse()?;
+        Ok(num)
+    }
+}
+
+pub async fn handle_add(
+    url: String,
+    output: Option<PathBuf>,
+    speed_limit: Option<String>,
+    proxy: Option<String>,
+    checksum: Option<String>,
+    priority: u8,
+    registry: &mut Registry,
+) -> Result<()> {
     let target_path = match output {
         Some(p) => p,
         None => {
@@ -79,18 +116,28 @@ pub async fn handle_add(url: String, output: Option<PathBuf>, registry: &mut Reg
         }
     };
 
-    // Verify URL and get content length immediately
     println!("Verifying URL: {}...", url);
     let client = reqwest::Client::new();
     let response = client.head(&url).send().await?;
-    
+
     if !response.status().is_success() {
         return Err(anyhow::anyhow!("URL verification failed: Status {}", response.status()));
     }
 
     let id = registry.add(url.clone(), target_path.clone());
+
+    let max_speed = if let Some(ref limit) = speed_limit {
+        Some(parse_speed_limit(limit)?)
+    } else {
+        None
+    };
+
+    if priority > 0 || proxy.is_some() || checksum.is_some() || max_speed.is_some() {
+        registry.update_advanced(&id, Some(priority), proxy, checksum, max_speed);
+    }
+
     registry.save()?;
-    
+
     println!("Added download {} -> {}", id, target_path.display());
     Ok(())
 }
@@ -101,26 +148,25 @@ pub fn handle_list(registry: &Registry) {
         return;
     }
 
-    // Standardized widths
     let id_w = 15;
     let status_w = 12;
     let target_w = 45;
     let url_w = 50;
 
     println!(
-        "{:<id_w$} | {:<status_w$} | {:<target_w$} | {:<url_w$}", 
-        "ID", "Status", "Target", "URL", 
+        "{:<id_w$} | {:<status_w$} | {:<target_w$} | {:<url_w$}",
+        "ID", "Status", "Target", "URL",
         id_w=id_w, status_w=status_w, target_w=target_w, url_w=url_w
     );
     println!(
-        "{:-<id_w$}-+-{:-<status_w$}-+-{:-<target_w$}-+-{:-<url_w$}", 
-        "", "", "", "", 
+        "{:-<id_w$}-+-{:-<status_w$}-+-{:-<target_w$}-+-{:-<url_w$}",
+        "", "", "", "",
         id_w=id_w, status_w=status_w, target_w=target_w, url_w=url_w
     );
-    
+
     for (id, entry) in &registry.downloads {
         let status_str = match &entry.status {
-            super::registry::DownloadStatus::Error(_) => "Error".to_string(),
+            crate::registry::DownloadStatus::Error(_) => "Error".to_string(),
             s => format!("{:?}", s),
         };
 
@@ -167,12 +213,12 @@ pub async fn handle_inspect(id: String, registry: &Registry) -> Result<()> {
         }
 
         println!("Inspecting snapshot: {}", warp_path.display());
-        let snapshot = super::beat::load_warp_file(&warp_path).await?;
-        
-        let toml_string = toml::to_string_pretty(&snapshot)?;
-        println!("\n--- .warp Content (TOML) ---\n");
-        println!("{}", toml_string);
-        println!("\n---------------------------");
+        let snapshot = crate::beat::load_warp_file(&warp_path).await?;
+
+        let json_string = serde_json::to_string_pretty(&snapshot)?;
+        println!("\n--- .warp Content ---\n");
+        println!("{}", json_string);
+        println!("\n---------------------");
     } else {
         println!("Download ID {} not found.", id);
     }
@@ -181,7 +227,7 @@ pub async fn handle_inspect(id: String, registry: &Registry) -> Result<()> {
 
 pub fn handle_pause(id: String, registry: &mut Registry) -> Result<()> {
     if registry.downloads.contains_key(&id) {
-        registry.update_status(&id, super::registry::DownloadStatus::Paused);
+        registry.update_status(&id, crate::registry::DownloadStatus::Paused);
         registry.save()?;
         println!("Paused download: {}", id);
     } else {
@@ -192,7 +238,7 @@ pub fn handle_pause(id: String, registry: &mut Registry) -> Result<()> {
 
 pub fn handle_resume(id: String, registry: &mut Registry) -> Result<()> {
     if registry.downloads.contains_key(&id) {
-        registry.update_status(&id, super::registry::DownloadStatus::Pending);
+        registry.update_status(&id, crate::registry::DownloadStatus::Pending);
         registry.save()?;
         println!("Resumed download: {}", id);
     } else {
@@ -203,7 +249,7 @@ pub fn handle_resume(id: String, registry: &mut Registry) -> Result<()> {
 
 pub fn handle_retry(id: String, registry: &mut Registry) -> Result<()> {
     if registry.downloads.contains_key(&id) {
-        registry.update_status(&id, super::registry::DownloadStatus::Pending);
+        registry.update_status(&id, crate::registry::DownloadStatus::Pending);
         registry.save()?;
         println!("Retrying download: {}", id);
     } else {
@@ -219,123 +265,43 @@ pub fn handle_clean(registry: &mut Registry) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "capture")]
-pub async fn handle_intercept(interface: Option<String>) -> Result<()> {
-    use crate::interceptor::types::InterceptorConfig;
-    use crate::interceptor::{Interceptor, npcap_check};
-    
-    // Check if Npcap is installed
-    npcap_check::ensure_npcap_or_error()?;
-    
-    println!("Starting network request interceptor...");
-    if let Some(ref iface) = interface {
-        println!("Using interface: {}", iface);
-    } else {
-        println!("Auto-detecting network interface...");
-    }
-    
-    let config = InterceptorConfig {
-        interface_name: interface,
-        ..Default::default()
-    };
-    
-    let interceptor = Interceptor::new(config);
-    interceptor.start().await?;
-    
-    println!("Interceptor is running. Press Ctrl+C to stop.");
-    println!("Making HTTP requests in another window will be captured here.\n");
-    
-    // Keep running until Ctrl+C
-    tokio::signal::ctrl_c().await?;
-    println!("\nStopping interceptor...");
-    
-    let count = interceptor.count().await;
-    interceptor.stop().await?;
-    println!("Stopped. Total requests captured: {}", count);
-    
-    Ok(())
-}
-
-#[cfg(not(feature = "capture"))]
-pub async fn handle_intercept(_interface: Option<String>) -> Result<()> {
-    Err(anyhow::anyhow!(
-        "The 'intercept' command requires the 'capture' feature. \
-        Run with: cargo run --features capture -- intercept\n\
-        Note: This requires Npcap to be installed on Windows. \
-        Download from: https://nmap.org/npcap/"
-    ))
-}
-
-pub fn handle_example() -> Result<()> {
-    use crate::interceptor::example::simulate_capture;
-    
-    println!("Running interceptor example/simulation...\n");
-    simulate_capture();
-    
-    Ok(())
-}
-
-#[cfg(feature = "capture")]
-pub fn handle_intercept_list() -> Result<()> {
-    println!("Listing captured requests...\n");
-    println!("Note: This shows requests from a running interceptor instance.");
-    println!("Start an interceptor with: warp intercept\n");
-    println!("For now, run the example to see simulated requests:");
-    println!("  cargo run -- example\n");
-    
-    Ok(())
-}
-
-#[cfg(not(feature = "capture"))]
-pub fn handle_intercept_list() -> Result<()> {
-    Err(anyhow::anyhow!(
-        "The 'intercept-list' command requires the 'capture' feature. \
-        Run with: cargo run --features capture -- intercept-list"
-    ))
-}
-
-#[cfg(feature = "capture")]
-pub fn handle_intercept_clear() -> Result<()> {
-    println!("Clearing captured requests...");
-    println!("Note: This clears requests from a running interceptor instance.\n");
-    println!("For now, run the example to see simulated requests:");
-    println!("  cargo run -- example\n");
-    
-    Ok(())
-}
-
-#[cfg(not(feature = "capture"))]
-pub fn handle_intercept_clear() -> Result<()> {
-    Err(anyhow::anyhow!(
-        "The 'intercept-clear' command requires the 'capture' feature. \
-        Run with: cargo run --features capture -- intercept-clear"
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use super::*;
+
+    fn empty_registry() -> Registry {
+        Registry::default()
+    }
+
     #[tokio::test]
-    #[ignore] // Requires internet access
+    #[ignore]
     async fn test_handle_add_derives_filename() {
-        let mut registry = Registry::default();
+        let mut registry = empty_registry();
         let url = "http://example.com/somefile.txt?query=1".to_string();
-        handle_add(url.clone(), None, &mut registry).await.ok();
-        
+        handle_add(url.clone(), None, None, None, None, 0, &mut registry).await.ok();
         let entry = registry.downloads.values().next().unwrap();
         assert_eq!(entry.url, url);
         assert_eq!(entry.target_path.to_str().unwrap(), "somefile.txt");
     }
 
     #[tokio::test]
-    #[ignore] // Requires internet access
+    #[ignore]
     async fn test_handle_add_explicit_path() {
-        let mut registry = Registry::default();
+        let mut registry = empty_registry();
         let path = PathBuf::from("explicit.bin");
-        handle_add("http://example.com".to_string(), Some(path.clone()), &mut registry).await.ok();
-        
+        handle_add("http://example.com".to_string(), Some(path.clone()), None, None, None, 0, &mut registry).await.ok();
         let entry = registry.downloads.values().next().unwrap();
         assert_eq!(entry.target_path, path);
+    }
+
+    #[tokio::test]
+    fn test_parse_speed_limit() {
+        assert_eq!(parse_speed_limit("1M").unwrap(), 1024 * 1024);
+        assert_eq!(parse_speed_limit("500K").unwrap(), 500 * 1024);
+        assert_eq!(parse_speed_limit("2G").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_speed_limit("1000").unwrap(), 1000);
+        assert_eq!(parse_speed_limit("2.5M").unwrap(), (2.5 * 1024.0 * 1024.0) as u64);
     }
 }

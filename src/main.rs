@@ -5,12 +5,19 @@
 //! and a heartbeat-based snapshot system.
 
 pub mod ui;
-mod downloader;
-mod interceptor;
+mod cli;
+mod engine;
+mod manager;
+mod segment;
+mod beat;
+mod registry;
+mod resources;
+mod utils;
+mod hls;
 
 use clap::Parser;
-use crate::downloader::cli::{Cli, Commands};
-use crate::downloader::registry::Registry;
+use cli::{Cli, Commands};
+use registry::Registry;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
@@ -20,50 +27,38 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut registry = Registry::load()?;
 
     match cli.command {
-        Commands::Add { url, output } => {
-            downloader::cli::handle_add(url, output, &mut registry).await?;
+        Commands::Add { url, output, speed_limit, proxy, checksum, priority } => {
+            cli::handle_add(url, output, speed_limit, proxy, checksum, priority, &mut registry).await?;
         }
         Commands::List => {
-            downloader::cli::handle_list(&registry);
+            cli::handle_list(&registry);
         }
         Commands::Remove { id } => {
-            downloader::cli::handle_remove(id, &mut registry)?;
+            cli::handle_remove(id, &mut registry)?;
         }
         Commands::Run => {
-            downloader::engine::run_all(&mut registry).await?;
+            engine::run_all(&mut registry).await?;
         }
         Commands::Inspect { id } => {
-            downloader::cli::handle_inspect(id, &registry).await?;
+            cli::handle_inspect(id, &registry).await?;
         }
         Commands::Pause { id } => {
-            downloader::cli::handle_pause(id, &mut registry)?;
+            cli::handle_pause(id, &mut registry)?;
         }
         Commands::Resume { id } => {
-            downloader::cli::handle_resume(id, &mut registry)?;
+            cli::handle_resume(id, &mut registry)?;
         }
         Commands::Retry { id } => {
-            downloader::cli::handle_retry(id, &mut registry)?;
+            cli::handle_retry(id, &mut registry)?;
         }
         Commands::Clean => {
-            downloader::cli::handle_clean(&mut registry)?;
+            cli::handle_clean(&mut registry)?;
         }
         Commands::Tui => {
             ui::tui::run(registry)?;
         }
-        Commands::Gui => {
-            ui::gui::run(registry).map_err(|e| anyhow::anyhow!("GUI error: {}", e))?;
-        }
-        Commands::Intercept { interface } => {
-            downloader::cli::handle_intercept(interface).await?;
-        }
-        Commands::InterceptList => {
-            downloader::cli::handle_intercept_list()?;
-        }
-        Commands::InterceptClear => {
-            downloader::cli::handle_intercept_clear()?;
-        }
-        Commands::Example => {
-            downloader::cli::handle_example()?;
+        Commands::M3u8 { url, output, quality, concurrent } => {
+            hls::download_hls(&url, &output, quality, concurrent).await?;
         }
     }
 

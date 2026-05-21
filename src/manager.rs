@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use indicatif::ProgressBar;
-use super::utils::HumanBytes;
+use crate::utils::HumanBytes;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use tokio::sync::{Mutex, Semaphore};
-use super::segment::{download_worker, Chunk};
+use crate::segment::{download_worker, Chunk};
 
 /// Holds the essential metadata for a download session.
 pub struct Metadata {
@@ -97,7 +97,7 @@ impl Manager {
     }
 
     /// Initializes a Manager from a DownloadEntry, automatically attempting to resume.
-    pub async fn from_entry(entry: &super::registry::DownloadEntry) -> Result<Self, anyhow::Error> {
+    pub async fn from_entry(entry: &crate::registry::DownloadEntry) -> Result<Self, anyhow::Error> {
         let warp_path = entry.target_path.with_extension("warp");
         
         let mut client_builder = reqwest::Client::builder();
@@ -109,7 +109,7 @@ impl Manager {
         let client = Arc::new(client_builder.build()?);
 
         let metadata = if warp_path.exists() {
-            match super::beat::load_snapshot(&warp_path).await {
+            match crate::beat::load_snapshot(&warp_path).await {
                 Ok(mut m) => {
                     m.max_speed_bytes = entry.max_speed_bytes;
                     m
@@ -157,7 +157,7 @@ impl Manager {
         let hb_path_clone = hb_path.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = super::beat::start_heartbeat_sync(hb_metadata, hb_token, &hb_path_clone).await {
+            if let Err(e) = crate::beat::start_heartbeat_sync(hb_metadata, hb_token, &hb_path_clone).await {
                 eprintln!("Heartbeat failed: {}", e);
             }
         });
@@ -372,9 +372,9 @@ mod tests {
             let chunks = metadata.chunks.lock().await;
             chunks[0].progress.store(2500, Ordering::SeqCst);
         }
-        super::super::beat::save_snapshot_sync(&metadata, &warp_path).await.unwrap();
+        crate::beat::save_snapshot_sync(&metadata, &warp_path).await.unwrap();
 
-        let mut registry = crate::downloader::registry::Registry::default();
+        let mut registry = crate::registry::Registry::default();
         let id = registry.add("http://test.com".to_string(), target_path.clone());
         let entry = registry.downloads.get(&id).unwrap();
 

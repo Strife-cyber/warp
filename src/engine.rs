@@ -2,9 +2,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::task::JoinSet;
 use tokio::sync::Semaphore;
-use super::manager::Manager;
-use super::registry::{Registry, DownloadStatus};
-use super::resources::calculate_optimal_workers;
+use crate::manager::Manager;
+use crate::registry::{Registry, DownloadStatus};
+use crate::resources::calculate_optimal_workers;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 pub async fn run_all(registry: &mut Registry) -> Result<()> {
