@@ -10,10 +10,11 @@ mod engine;
 mod manager;
 mod segment;
 mod beat;
-mod registry;
+mod download_registry;
 mod resources;
 mod utils;
 mod hls;
+mod registry;
 
 use clap::Parser;
 use cli::{Cli, Commands};
@@ -23,7 +24,7 @@ use registry::Registry;
 async fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
 
-    // Load the global registry
+    // Load the global download_registry
     let mut registry = Registry::load()?;
 
     match cli.command {

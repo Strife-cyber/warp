@@ -97,7 +97,7 @@ pub async fn run_all(registry: &mut Registry) -> Result<()> {
                 registry.update_status(&id, new_status);
             }
             Ok(Err((id, err_msg))) => {
-                registry.update_status(&id, DownloadStatus::Error(err_msg));
+                registry.update_status(&id, DownloadStatus::Error);
             }
             Err(e) => {
                 eprintln!("Manager task panicked: {}", e);

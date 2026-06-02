@@ -4,14 +4,16 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(sqlx::Type, Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[sqlx(type_name = "TEXT")]
 pub enum DownloadStatus {
     Pending,
     Downloading,
     Paused,
     Completed,
-    Error(String),
+    Error,
 }
+
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DownloadEntry {
@@ -27,6 +29,8 @@ pub struct DownloadEntry {
     pub checksum: Option<String>,
     #[serde(default)]
     pub max_speed_bytes: Option<u64>,
+    #[serde(default)]
+    pub error_message: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -37,7 +41,7 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Returns the path to the registry JSON file, creating the directory if needed.
+    /// Returns the path to the download_registry JSON file, creating the directory if needed.
     fn get_registry_path(&self) -> Result<PathBuf> {
         if let Some(ref path) = self.custom_path {
             return Ok(path.clone());
@@ -50,10 +54,10 @@ impl Registry {
             std::fs::create_dir_all(config_dir).context("Failed to create config directory")?;
         }
         
-        Ok(config_dir.join("registry.json"))
+        Ok(config_dir.join("download_registry.json"))
     }
 
-    /// Loads the registry from disk, or creates a new empty one if it doesn't exist.
+    /// Loads the download_registry from disk, or creates a new empty one if it doesn't exist.
     pub fn load() -> Result<Self> {
         let dummy = Self::default();
         let path = dummy.get_registry_path()?;
@@ -65,8 +69,8 @@ impl Registry {
                     Ok(registry)
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to parse registry file at {}: {}", path.display(), e);
-                    eprintln!("Creating a new empty registry...");
+                    eprintln!("Warning: Failed to parse download_registry file at {}: {}", path.display(), e);
+                    eprintln!("Creating a new empty download_registry...");
                     Ok(Registry::default())
                 }
             }
@@ -75,7 +79,7 @@ impl Registry {
         }
     }
 
-    /// Saves the current state of the registry to disk.
+    /// Saves the current state of the download_registry to disk.
     pub fn save(&self) -> Result<()> {
         let path = self.get_registry_path()?;
         let data = serde_json::to_string_pretty(self)?;
@@ -101,6 +105,7 @@ impl Registry {
             proxy: None,
             checksum: None,
             max_speed_bytes: None,
+            error_message: None,
         };
         
         self.downloads.insert(id.clone(), entry);
@@ -129,7 +134,7 @@ impl Registry {
         }
     }
 
-    /// Removes all completed downloads from the registry.
+    /// Removes all completed downloads from the download_registry.
     pub fn clean_completed(&mut self) -> usize {
         let before = self.downloads.len();
         self.downloads.retain(|_, entry| entry.status != DownloadStatus::Completed);
@@ -183,9 +188,9 @@ mod tests {
         registry.update_status(&id, DownloadStatus::Completed);
         assert_eq!(registry.downloads.get(&id).unwrap().status, DownloadStatus::Completed);
         
-        registry.update_status(&id, DownloadStatus::Error("Fail".to_string()));
+        registry.update_status(&id, DownloadStatus::Error);
         match &registry.downloads.get(&id).unwrap().status {
-            DownloadStatus::Error(msg) => assert_eq!(msg, "Fail"),
+            DownloadStatus::Error => assert!(true),
             _ => panic!("Expected Error status"),
         }
     }

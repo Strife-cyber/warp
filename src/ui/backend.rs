@@ -37,7 +37,7 @@ impl UiBackend {
         
         let state_clone = Arc::clone(&state);
         
-        // Populate initial state from registry
+        // Populate initial state from download_registry
         {
             let mut s = state_clone.write().unwrap();
             for (id, entry) in &registry.downloads {
@@ -192,12 +192,12 @@ impl UiBackend {
                                     p.speed = 0;
                                 }
                             }
-                            Ok((id, _task_token, Err(msg))) => {
+                            Ok((id, _task_token, Err(_))) => {
                                 tokens.remove(&id);
-                                registry.update_status(&id, DownloadStatus::Error(msg.clone()));
+                                registry.update_status(&id, DownloadStatus::Error);
                                 registry.save().ok();
                                 if let Some(p) = state_clone.write().unwrap().get_mut(&id) {
-                                    p.status = DownloadStatus::Error(msg);
+                                    p.status = DownloadStatus::Error;
                                     p.speed = 0;
                                 }
                             }

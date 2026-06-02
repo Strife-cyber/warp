@@ -157,14 +157,14 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                 let status_str = match progress.status {
                     crate::registry::DownloadStatus::Downloading => "Downloading",
                     crate::registry::DownloadStatus::Paused => "Paused",
-                    crate::registry::DownloadStatus::Error(_) => "Error",
+                    crate::registry::DownloadStatus::Error => "Error",
                     crate::registry::DownloadStatus::Completed => "Completed",
                     crate::registry::DownloadStatus::Pending => "Pending",
                 };
                 let status_color = match progress.status {
                     crate::registry::DownloadStatus::Downloading => Color::Green,
                     crate::registry::DownloadStatus::Paused => Color::Yellow,
-                    crate::registry::DownloadStatus::Error(_) => Color::Red,
+                    crate::registry::DownloadStatus::Error => Color::Red,
                     crate::registry::DownloadStatus::Completed => Color::LightBlue,
                     crate::registry::DownloadStatus::Pending => Color::DarkGray,
                 };

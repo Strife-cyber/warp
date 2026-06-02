@@ -61,7 +61,7 @@ pub enum Commands {
         /// The ID of the download to retry
         id: String,
     },
-    /// Removes all completed downloads from the registry
+    /// Removes all completed downloads from the download_registry
     Clean,
     /// Launches the interactive Terminal UI
     Tui,
@@ -144,7 +144,7 @@ pub async fn handle_add(
 
 pub fn handle_list(registry: &Registry) {
     if registry.downloads.is_empty() {
-        println!("No downloads in registry.");
+        println!("No downloads in download_registry.");
         return;
     }
 
@@ -166,7 +166,7 @@ pub fn handle_list(registry: &Registry) {
 
     for (id, entry) in &registry.downloads {
         let status_str = match &entry.status {
-            crate::registry::DownloadStatus::Error(_) => "Error".to_string(),
+            crate::registry::DownloadStatus::Error => "Error".to_string(),
             s => format!("{:?}", s),
         };
 
