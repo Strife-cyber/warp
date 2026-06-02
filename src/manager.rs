@@ -368,11 +368,19 @@ mod tests {
         }
         crate::beat::save_snapshot_sync(&metadata, &warp_path).await.unwrap();
 
-        let mut registry = crate::registry::Registry::default();
-        let id = registry.add("http://test.com".to_string(), target_path.clone());
-        let entry = registry.downloads.get(&id).unwrap();
+        let entry = crate::registry::DownloadEntry {
+            id: "test".to_string(),
+            url: "http://test.com".to_string(),
+            target_path: target_path.clone(),
+            status: crate::registry::DownloadStatus::Pending,
+            priority: 0,
+            proxy: None,
+            checksum: None,
+            max_speed_bytes: None,
+            error_message: None,
+        };
 
-        let manager = Manager::from_entry(entry).await.unwrap();
+        let manager = Manager::from_entry(&entry).await.unwrap();
         assert_eq!(manager.metadata.total_progress().await, 2500);
     }
 

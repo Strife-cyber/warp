@@ -1,4 +1,4 @@
-use crate::registry::Registry;
+use crate::download_registry::Registry;
 use crate::ui::backend::{UiBackend, UiMessage};
 use crate::utils::HumanBytes;
 use anyhow::Result;

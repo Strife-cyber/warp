@@ -2,7 +2,8 @@ use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::{mpsc, Semaphore};
-use crate::registry::{Registry, DownloadStatus};
+use crate::download_registry::Registry;
+use crate::registry::DownloadStatus;
 use crate::manager::Manager;
 use tokio::task::JoinSet;
 
@@ -31,33 +32,46 @@ pub struct UiBackend {
 }
 
 impl UiBackend {
-    pub fn spawn(mut registry: Registry) -> Self {
+    pub fn spawn(registry: Registry) -> Self {
         let (tx, mut rx) = mpsc::channel::<UiMessage>(32);
         let state = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(registry);
         
         let state_clone = Arc::clone(&state);
+        let registry_init = Arc::clone(&registry);
         
-        // Populate initial state from download_registry
-        {
-            let mut s = state_clone.write().unwrap();
-            for (id, entry) in &registry.downloads {
-                let downloaded = if entry.status == DownloadStatus::Completed {
-                    1 // hack to show 100% easily for completed ones, but we should do it properly later if size is missing
-                } else {
-                    0
-                };
-                
-                s.insert(id.clone(), DownloadProgress {
-                    id: id.clone(),
-                    url: entry.url.clone(),
-                    target_path: entry.target_path.to_string_lossy().into_owned(),
-                    status: entry.status.clone(),
-                    downloaded,
-                    total: if entry.status == DownloadStatus::Completed { 1 } else { 0 },
-                    speed: 0,
-                });
+        tokio::spawn(async move {
+            if let Ok(entries) = registry_init.list().await {
+                let mut s = state_clone.write().unwrap();
+                for entry in entries {
+                    let downloaded = if entry.status == DownloadStatus::Completed {
+                        1
+                    } else {
+                        0
+                    };
+
+                    s.insert(
+                        entry.id.clone(),
+                        DownloadProgress {
+                            id: entry.id.clone(),
+                            url: entry.url.clone(),
+                            target_path: entry.target_path.to_string_lossy().into_owned(),
+                            status: entry.status.clone(),
+                            downloaded,
+                            total: if entry.status == DownloadStatus::Completed {
+                                1
+                            } else {
+                                0
+                            },
+                            speed: 0,
+                        },
+                    );
+                }
             }
-        }
+        });
+
+        let state_clone = Arc::clone(&state);
+        let registry_task = Arc::clone(&registry);
 
         let tx_task = tx.clone();
         tokio::spawn(async move {
@@ -72,9 +86,13 @@ impl UiBackend {
                     Some(msg) = rx.recv() => {
                         match msg {
                             UiMessage::Add(url, path) => {
-                                let id = registry.add(url.clone(), path.clone());
-                                registry.save().ok();
-                                // Update state
+                                let id = match registry_task.add(url.clone(), path.clone()).await {
+                                    Ok(id) => id,
+                                    Err(e) => {
+                                        eprintln!("Failed to add download: {e}");
+                                        continue;
+                                    }
+                                };
                                 {
                                     let mut s = state_clone.write().unwrap();
                                     s.insert(id.clone(), DownloadProgress {
@@ -87,12 +105,10 @@ impl UiBackend {
                                         speed: 0,
                                     });
                                 }
-                                // Start immediately
                                 tx_task.send(UiMessage::Resume(id)).await.ok();
                             }
                             UiMessage::Pause(id) => {
-                                registry.update_status(&id, DownloadStatus::Paused);
-                                registry.save().ok();
+                                registry_task.update_status(&id, DownloadStatus::Paused).await.ok();
                                 if let Some(token) = tokens.remove(&id) {
                                     token.cancel();
                                 }
@@ -102,16 +118,17 @@ impl UiBackend {
                                 }
                             }
                             UiMessage::Resume(id) => {
-                                let entry_clone = {
-                                    if let Some(entry) = registry.downloads.get_mut(&id) {
+                                let entry_clone = match registry_task.get(&id).await {
+                                    Ok(Some(mut entry)) => {
                                         entry.status = DownloadStatus::Downloading;
-                                        entry.clone()
-                                    } else {
-                                        continue;
+                                        if registry_task.update_entry(&id, entry.clone()).await.is_err() {
+                                            continue;
+                                        }
+                                        entry
                                     }
+                                    _ => continue,
                                 };
-                                registry.save().ok();
-                                
+
                                 if let Some(p) = state_clone.write().unwrap().get_mut(&id) {
                                     p.status = DownloadStatus::Downloading;
                                 }
@@ -134,7 +151,6 @@ impl UiBackend {
                                                 }
                                             }
 
-                                            // Progress poller
                                             let poller_token = task_token.clone();
                                             let poller_meta = Arc::clone(&meta);
                                             let poller_state = Arc::clone(&state_for_task);
@@ -169,8 +185,7 @@ impl UiBackend {
                                 if let Some(token) = tokens.remove(&id) {
                                     token.cancel();
                                 }
-                                registry.remove(&id);
-                                registry.save().ok();
+                                registry_task.remove(&id).await.ok();
                                 state_clone.write().unwrap().remove(&id);
                             }
                             UiMessage::Quit => {
@@ -185,8 +200,7 @@ impl UiBackend {
                         match res {
                             Ok((id, _task_token, Ok(status))) => {
                                 tokens.remove(&id);
-                                registry.update_status(&id, status.clone());
-                                registry.save().ok();
+                                registry_task.update_status(&id, status.clone()).await.ok();
                                 if let Some(p) = state_clone.write().unwrap().get_mut(&id) {
                                     p.status = status;
                                     p.speed = 0;
@@ -194,8 +208,7 @@ impl UiBackend {
                             }
                             Ok((id, _task_token, Err(_))) => {
                                 tokens.remove(&id);
-                                registry.update_status(&id, DownloadStatus::Error);
-                                registry.save().ok();
+                                registry_task.update_status(&id, DownloadStatus::Error).await.ok();
                                 if let Some(p) = state_clone.write().unwrap().get_mut(&id) {
                                     p.status = DownloadStatus::Error;
                                     p.speed = 0;

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
-use crate::registry::Registry;
+use crate::download_registry::Registry;
+use crate::registry::DownloadStatus;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -105,7 +106,7 @@ pub async fn handle_add(
     proxy: Option<String>,
     checksum: Option<String>,
     priority: u8,
-    registry: &mut Registry,
+    registry: &Registry,
 ) -> Result<()> {
     let target_path = match output {
         Some(p) => p,
@@ -124,7 +125,7 @@ pub async fn handle_add(
         return Err(anyhow::anyhow!("URL verification failed: Status {}", response.status()));
     }
 
-    let id = registry.add(url.clone(), target_path.clone());
+    let id = registry.add(url.clone(), target_path.clone()).await?;
 
     let max_speed = if let Some(ref limit) = speed_limit {
         Some(parse_speed_limit(limit)?)
@@ -133,19 +134,20 @@ pub async fn handle_add(
     };
 
     if priority > 0 || proxy.is_some() || checksum.is_some() || max_speed.is_some() {
-        registry.update_advanced(&id, Some(priority), proxy, checksum, max_speed);
+        registry
+            .update_advanced(&id, Some(priority), proxy, checksum, max_speed)
+            .await?;
     }
-
-    registry.save()?;
 
     println!("Added download {} -> {}", id, target_path.display());
     Ok(())
 }
 
-pub fn handle_list(registry: &Registry) {
-    if registry.downloads.is_empty() {
+pub async fn handle_list(registry: &Registry) -> Result<()> {
+    let entries = registry.list().await?;
+    if entries.is_empty() {
         println!("No downloads in download_registry.");
-        return;
+        return Ok(());
     }
 
     let id_w = 15;
@@ -164,9 +166,9 @@ pub fn handle_list(registry: &Registry) {
         id_w=id_w, status_w=status_w, target_w=target_w, url_w=url_w
     );
 
-    for (id, entry) in &registry.downloads {
+    for entry in entries {
         let status_str = match &entry.status {
-            crate::registry::DownloadStatus::Error => "Error".to_string(),
+            DownloadStatus::Error => "Error".to_string(),
             s => format!("{:?}", s),
         };
 
@@ -185,18 +187,18 @@ pub fn handle_list(registry: &Registry) {
 
         println!(
             "{:<id_w$} | {:<status_w$} | {:<target_w$} | {:<url_w$}",
-            id,
+            entry.id,
             status_str,
             display_target,
             display_url,
             id_w=id_w, status_w=status_w, target_w=target_w, url_w=url_w
         );
     }
+    Ok(())
 }
 
-pub fn handle_remove(id: String, registry: &mut Registry) -> Result<()> {
-    if let Some(entry) = registry.remove(&id) {
-        registry.save()?;
+pub async fn handle_remove(id: String, registry: &Registry) -> Result<()> {
+    if let Some(entry) = registry.remove(&id).await? {
         println!("Removed download: {} ({})", id, entry.url);
     } else {
         println!("Download ID {} not found.", id);
@@ -205,7 +207,7 @@ pub fn handle_remove(id: String, registry: &mut Registry) -> Result<()> {
 }
 
 pub async fn handle_inspect(id: String, registry: &Registry) -> Result<()> {
-    if let Some(entry) = registry.downloads.get(&id) {
+    if let Some(entry) = registry.get(&id).await? {
         let warp_path = entry.target_path.with_extension("warp");
         if !warp_path.exists() {
             println!("No .warp file found for ID {}. Has the download started?", id);
@@ -225,42 +227,41 @@ pub async fn handle_inspect(id: String, registry: &Registry) -> Result<()> {
     Ok(())
 }
 
-pub fn handle_pause(id: String, registry: &mut Registry) -> Result<()> {
-    if registry.downloads.contains_key(&id) {
-        registry.update_status(&id, crate::registry::DownloadStatus::Paused);
-        registry.save()?;
-        println!("Paused download: {}", id);
-    } else {
-        println!("Download ID {} not found.", id);
+pub async fn handle_pause(id: String, registry: &Registry) -> Result<()> {
+    match registry.get(&id).await? {
+        Some(_) => {
+            registry.update_status(&id, DownloadStatus::Paused).await?;
+            println!("Paused download: {}", id);
+        }
+        None => println!("Download ID {} not found.", id),
     }
     Ok(())
 }
 
-pub fn handle_resume(id: String, registry: &mut Registry) -> Result<()> {
-    if registry.downloads.contains_key(&id) {
-        registry.update_status(&id, crate::registry::DownloadStatus::Pending);
-        registry.save()?;
-        println!("Resumed download: {}", id);
-    } else {
-        println!("Download ID {} not found.", id);
+pub async fn handle_resume(id: String, registry: &Registry) -> Result<()> {
+    match registry.get(&id).await? {
+        Some(_) => {
+            registry.update_status(&id, DownloadStatus::Pending).await?;
+            println!("Resumed download: {}", id);
+        }
+        None => println!("Download ID {} not found.", id),
     }
     Ok(())
 }
 
-pub fn handle_retry(id: String, registry: &mut Registry) -> Result<()> {
-    if registry.downloads.contains_key(&id) {
-        registry.update_status(&id, crate::registry::DownloadStatus::Pending);
-        registry.save()?;
-        println!("Retrying download: {}", id);
-    } else {
-        println!("Download ID {} not found.", id);
+pub async fn handle_retry(id: String, registry: &Registry) -> Result<()> {
+    match registry.get(&id).await? {
+        Some(_) => {
+            registry.update_status(&id, DownloadStatus::Pending).await?;
+            println!("Retrying download: {}", id);
+        }
+        None => println!("Download ID {} not found.", id),
     }
     Ok(())
 }
 
-pub fn handle_clean(registry: &mut Registry) -> Result<()> {
-    let removed = registry.clean_completed();
-    registry.save()?;
+pub async fn handle_clean(registry: &Registry) -> Result<()> {
+    let removed = registry.clean_completed().await?;
     println!("Cleaned {} completed downloads.", removed);
     Ok(())
 }
@@ -269,17 +270,15 @@ pub fn handle_clean(registry: &mut Registry) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn empty_registry() -> Registry {
-        Registry::default()
-    }
-
     #[tokio::test]
     #[ignore]
     async fn test_handle_add_derives_filename() {
-        let mut registry = empty_registry();
+        let registry = Registry::open_in_memory().await.unwrap();
         let url = "http://example.com/somefile.txt?query=1".to_string();
-        handle_add(url.clone(), None, None, None, None, 0, &mut registry).await.ok();
-        let entry = registry.downloads.values().next().unwrap();
+        handle_add(url.clone(), None, None, None, None, 0, &registry)
+            .await
+            .ok();
+        let entry = registry.list().await.unwrap().pop().unwrap();
         assert_eq!(entry.url, url);
         assert_eq!(entry.target_path.to_str().unwrap(), "somefile.txt");
     }
@@ -287,10 +286,20 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_handle_add_explicit_path() {
-        let mut registry = empty_registry();
+        let registry = Registry::open_in_memory().await.unwrap();
         let path = PathBuf::from("explicit.bin");
-        handle_add("http://example.com".to_string(), Some(path.clone()), None, None, None, 0, &mut registry).await.ok();
-        let entry = registry.downloads.values().next().unwrap();
+        handle_add(
+            "http://example.com".to_string(),
+            Some(path.clone()),
+            None,
+            None,
+            None,
+            0,
+            &registry,
+        )
+        .await
+        .ok();
+        let entry = registry.list().await.unwrap().pop().unwrap();
         assert_eq!(entry.target_path, path);
     }
 
