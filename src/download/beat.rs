@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::path::Path;
 use std::time::Duration;
-use crate::segment::Chunk;
+use super::segment::Chunk;
 use tokio::sync::MutexGuard;
-use crate::manager::Metadata;
+use super::manager::Metadata;
 use std::collections::VecDeque;
 use std::sync::atomic::{Ordering};
 use tokio_util::sync::CancellationToken;

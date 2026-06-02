@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 use crate::download_registry::Registry;
-use crate::registry::DownloadStatus;
+use crate::core::DownloadStatus;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -34,7 +34,14 @@ pub enum Commands {
         priority: u8,
     },
     /// Lists all known downloads
-    List,
+    List {
+        /// Filter by category (video, audio, archive, document, image, other)
+        #[arg(long)]
+        category: Option<String>,
+        /// Search URL, path, or ID
+        #[arg(long)]
+        search: Option<String>,
+    },
     /// Removes a download by ID
     Remove {
         /// The ID of the download to remove
@@ -64,8 +71,26 @@ pub enum Commands {
     },
     /// Removes all completed downloads from the download_registry
     Clean,
-    /// Launches the interactive Terminal UI
+    /// Launches the native egui download manager
+    Gui,
+    /// Launches the interactive terminal UI
     Tui,
+    /// Runs the background HTTP daemon (shared registry API)
+    Serve {
+        #[arg(long, default_value_t = 9844)]
+        port: u16,
+    },
+    /// Shows per-host download metrics
+    Stats,
+    /// View or update application settings
+    Config {
+        /// Global speed limit (e.g. 1M, 500K)
+        #[arg(long)]
+        global_speed_limit: Option<String>,
+        /// Max concurrent segment workers (default 32)
+        #[arg(long)]
+        max_workers: Option<usize>,
+    },
     /// Downloads an HLS (M3U8) video stream
     M3u8 {
         /// The M3U8 playlist URL
@@ -143,8 +168,15 @@ pub async fn handle_add(
     Ok(())
 }
 
-pub async fn handle_list(registry: &Registry) -> Result<()> {
-    let entries = registry.list().await?;
+pub async fn handle_list(
+    registry: &Registry,
+    category: Option<String>,
+    search: Option<String>,
+) -> Result<()> {
+    let cat = category.as_deref().and_then(parse_category);
+    let entries = registry
+        .list_filtered(cat, search.as_deref())
+        .await?;
     if entries.is_empty() {
         println!("No downloads in download_registry.");
         return Ok(());
@@ -197,6 +229,38 @@ pub async fn handle_list(registry: &Registry) -> Result<()> {
     Ok(())
 }
 
+fn parse_category(input: &str) -> Option<crate::core::DownloadCategory> {
+    use crate::core::DownloadCategory;
+    match input.to_ascii_lowercase().as_str() {
+        "video" => Some(DownloadCategory::Video),
+        "audio" => Some(DownloadCategory::Audio),
+        "archive" => Some(DownloadCategory::Archive),
+        "document" => Some(DownloadCategory::Document),
+        "image" => Some(DownloadCategory::Image),
+        "other" => Some(DownloadCategory::Other),
+        _ => None,
+    }
+}
+
+pub async fn handle_stats(registry: &Registry) -> Result<()> {
+    let rows = crate::metrics::list_host_metrics(&registry.pool()).await?;
+    if rows.is_empty() {
+        println!("No download metrics recorded yet.");
+        return Ok(());
+    }
+    println!(
+        "{:<30} {:>8} {:>14} {:>14} {:>8}",
+        "Host", "Downloads", "Bytes", "Avg B/s", "Fails"
+    );
+    for r in rows {
+        println!(
+            "{:<30} {:>8} {:>14} {:>14} {:>8}",
+            r.host, r.downloads, r.bytes_total, r.avg_speed_bps as u64, r.failures
+        );
+    }
+    Ok(())
+}
+
 pub async fn handle_remove(id: String, registry: &Registry) -> Result<()> {
     if let Some(entry) = registry.remove(&id).await? {
         println!("Removed download: {} ({})", id, entry.url);
@@ -215,7 +279,7 @@ pub async fn handle_inspect(id: String, registry: &Registry) -> Result<()> {
         }
 
         println!("Inspecting snapshot: {}", warp_path.display());
-        let snapshot = crate::beat::load_warp_file(&warp_path).await?;
+        let snapshot = crate::download::beat::load_warp_file(&warp_path).await?;
 
         let json_string = serde_json::to_string_pretty(&snapshot)?;
         println!("\n--- .warp Content ---\n");
@@ -263,6 +327,47 @@ pub async fn handle_retry(id: String, registry: &Registry) -> Result<()> {
 pub async fn handle_clean(registry: &Registry) -> Result<()> {
     let removed = registry.clean_completed().await?;
     println!("Cleaned {} completed downloads.", removed);
+    Ok(())
+}
+
+pub async fn handle_config(
+    global_speed_limit: Option<String>,
+    max_workers: Option<usize>,
+    registry: &Registry,
+) -> Result<()> {
+    let mut settings = registry.get_settings().await?;
+    let mut changed = false;
+
+    if let Some(limit) = global_speed_limit {
+        settings.global_max_speed_bytes = Some(parse_speed_limit(&limit)?);
+        changed = true;
+    }
+    if let Some(workers) = max_workers {
+        if workers == 0 {
+            return Err(anyhow::anyhow!("max_workers must be at least 1"));
+        }
+        settings.max_workers = workers;
+        changed = true;
+    }
+
+    if changed {
+        registry.save_settings(&settings).await?;
+        if let Some(b) = settings.global_max_speed_bytes {
+            println!("Global speed limit set to {b} bytes/s.");
+        }
+        if max_workers.is_some() {
+            println!("Max workers set to {}.", settings.max_workers);
+        }
+    } else {
+        println!("daemon_port: {}", settings.daemon_port);
+        match settings.global_max_speed_bytes {
+            Some(b) => println!("global_max_speed_bytes: {b}"),
+            None => println!("global_max_speed_bytes: (unlimited)"),
+        }
+        println!("max_workers: {}", settings.max_workers);
+        println!("schedule_windows: {}", settings.schedule_windows.len());
+    }
+
     Ok(())
 }
 

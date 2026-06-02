@@ -15,7 +15,7 @@ use directories::ProjectDirs;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::ConnectOptions;
 
-use crate::registry::{DownloadEntry, DownloadStatus};
+use crate::core::{DownloadCategory, DownloadEntry, DownloadStatus, AppSettings};
 use repository::{DownloadRegistry, Repository};
 
 
@@ -49,6 +49,26 @@ impl Registry {
         })
     }
 
+    pub async fn add_hls(
+        &self,
+        url: String,
+        target_path: PathBuf,
+        quality: Option<String>,
+        concurrent: Option<u32>,
+    ) -> Result<String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock before UNIX epoch")?
+            .as_secs()
+            .to_string();
+
+        let entry = DownloadEntry::new_hls(id.clone(), url, target_path, quality, concurrent);
+        self.inner.add(entry).await?;
+        Ok(id)
+    }
+
     pub async fn add(&self, url: String, target_path: PathBuf) -> Result<String> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -58,17 +78,7 @@ impl Registry {
             .as_secs()
             .to_string();
 
-        let entry = DownloadEntry {
-            id: id.clone(),
-            url,
-            target_path,
-            status: DownloadStatus::Pending,
-            priority: 0,
-            proxy: None,
-            checksum: None,
-            max_speed_bytes: None,
-            error_message: None,
-        };
+        let entry = DownloadEntry::new_http(id.clone(), url, target_path);
 
         self.inner.add(entry).await?;
         Ok(id)
@@ -118,6 +128,26 @@ impl Registry {
         }
 
         self.inner.update(id, entry).await
+    }
+
+    pub async fn list_filtered(
+        &self,
+        category: Option<DownloadCategory>,
+        search: Option<&str>,
+    ) -> Result<Vec<DownloadEntry>> {
+        self.inner.list_filtered(category, search).await
+    }
+
+    pub async fn get_settings(&self) -> Result<AppSettings> {
+        self.inner.get_settings().await
+    }
+
+    pub async fn save_settings(&self, settings: &AppSettings) -> Result<()> {
+        self.inner.save_settings(settings).await
+    }
+
+    pub fn pool(&self) -> sqlx::SqlitePool {
+        self.inner.pool()
     }
 
     pub async fn list(&self) -> Result<Vec<DownloadEntry>> {
@@ -215,5 +245,25 @@ mod tests {
         let entries = registry.list().await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, id);
+        assert_eq!(entries[0].category, crate::core::DownloadCategory::Other);
+    }
+
+    #[tokio::test]
+    async fn test_registry_update_advanced() {
+        let registry = Registry::open_in_memory().await.unwrap();
+        let id = registry
+            .add("http://example.com".to_string(), PathBuf::from("f.bin"))
+            .await
+            .unwrap();
+
+        registry
+            .update_advanced(&id, Some(5), Some("http://proxy:8080".into()), None, Some(1024))
+            .await
+            .unwrap();
+
+        let entry = registry.get(&id).await.unwrap().unwrap();
+        assert_eq!(entry.priority, 5);
+        assert_eq!(entry.proxy.as_deref(), Some("http://proxy:8080"));
+        assert_eq!(entry.max_speed_bytes, Some(1024));
     }
 }

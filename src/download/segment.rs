@@ -4,10 +4,15 @@ use tokio::time::timeout;
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter, SeekFrom};
+
+use super::rate_limit::{acquire_composed, RunLimits};
 
 /// The default timeout for network requests and stream reads.
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Buffered writes — fewer syscalls under high concurrency.
+const WRITE_BUF_BYTES: usize = 256 * 1024;
 
 /// The minimum size in bytes for a chunk to be considered eligible for splitting.
 /// Smaller chunks are not split to avoid excessive HTTP overhead.
@@ -100,18 +105,21 @@ pub async fn download_worker(
     chunk: Arc<Chunk>,
     url: String,
     cancel_token: CancellationToken,
-    max_speed_bytes: Option<u64>,
+    limits: RunLimits,
+    use_range: bool,
 ) -> Result<(), anyhow::Error> {
-    // Open a private handle for this worker to allow concurrent writes without locking
-    let mut handle = tokio::fs::OpenOptions::new()
+    let file = tokio::fs::OpenOptions::new()
         .write(true)
         .open(&target_path)
         .await?;
+    let mut handle = BufWriter::with_capacity(WRITE_BUF_BYTES, file);
 
-    tokio::select! {
+    let result = tokio::select! {
         _ = cancel_token.cancelled() => Ok(()),
-        res = perform_download(&client, &mut handle, &chunk, &url, max_speed_bytes) => res,
-    }
+        res = perform_download(&client, &mut handle, &chunk, &url, limits, use_range) => res,
+    };
+    handle.flush().await?;
+    result
 }
 
 /// The inner download loop that performs the actual HTTP Range request and streaming.
@@ -120,10 +128,11 @@ pub async fn download_worker(
 /// while this one is downloading, it stops exactly at the new boundary.
 async fn perform_download(
     client: &reqwest::Client,
-    handle: &mut tokio::fs::File,
+    handle: &mut BufWriter<tokio::fs::File>,
     chunk: &Chunk,
     url: &str,
-    max_speed_bytes: Option<u64>,
+    limits: RunLimits,
+    use_range: bool,
 ) -> Result<(), anyhow::Error> {
     let mut retry_count = 0;
     let max_retries = 5;
@@ -144,10 +153,11 @@ async fn perform_download(
         // 2. Prepare the Range header for the request
         handle.seek(SeekFrom::Start(absolute_start)).await?;
 
-        let response_res = timeout(TIMEOUT, client
-            .get(url)
-            .header("Range", format!("bytes={}-{}", absolute_start, end_offset))
-            .send()).await;
+        let mut request = client.get(url);
+        if use_range {
+            request = request.header("Range", format!("bytes={absolute_start}-{end_offset}"));
+        }
+        let response_res = timeout(TIMEOUT, request.send()).await;
 
         let response = match response_res {
             Ok(Ok(resp)) => resp,
@@ -178,8 +188,6 @@ async fn perform_download(
 
         // 3. Process the byte stream
         let mut stream = response.bytes_stream();
-        let start_time = std::time::Instant::now();
-        let mut bytes_since_start = 0;
 
         while let Some(item) = stream.next().await {
             let packet = match item {
@@ -198,9 +206,9 @@ async fn perform_download(
             retry_count = 0;
             
             // 4. Re-check limits in case of a split during the stream
-            let limits = chunk.chunk_limits.lock().await;
-            let current_end = *limits.end();
-            let current_abs_start = *limits.start() + chunk.progress.load(Ordering::SeqCst);
+            let byte_limits = chunk.chunk_limits.lock().await;
+            let current_end = *byte_limits.end();
+            let current_abs_start = *byte_limits.start() + chunk.progress.load(Ordering::SeqCst);
             
             if current_abs_start > current_end {
                 return Ok(());
@@ -214,22 +222,13 @@ async fn perform_download(
 
             handle.write_all(&packet[..bytes_to_write]).await?;
             chunk.progress.fetch_add(bytes_to_write as u64, Ordering::SeqCst);
-            bytes_since_start += bytes_to_write as u64;
 
-            // Optional Throttling
-            if let Some(limit) = max_speed_bytes {
-                let elapsed = start_time.elapsed().as_secs_f64();
-                if elapsed > 0.0 {
-                    let current_speed = (bytes_since_start as f64) / elapsed;
-                    if current_speed > limit as f64 {
-                        let target_time = (bytes_since_start as f64) / (limit as f64);
-                        let sleep_time = target_time - elapsed;
-                        if sleep_time > 0.01 { // Only sleep if > 10ms
-                            tokio::time::sleep(Duration::from_secs_f64(sleep_time)).await;
-                        }
-                    }
-                }
-            }
+            acquire_composed(
+                limits.global.as_ref(),
+                limits.local.as_ref(),
+                bytes_to_write as u64,
+            )
+            .await;
             
             if bytes_to_write < packet.len() {
                 return Ok(());

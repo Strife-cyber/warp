@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::registry::{DownloadEntry, DownloadStatus};
+use crate::core::{DownloadEntry, DownloadStatus};
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct Registry {
@@ -80,17 +80,7 @@ impl Registry {
             .as_secs()
             .to_string();
 
-        let entry = DownloadEntry {
-            id: id.clone(),
-            url,
-            target_path,
-            status: DownloadStatus::Pending,
-            priority: 0,
-            proxy: None,
-            checksum: None,
-            max_speed_bytes: None,
-            error_message: None,
-        };
+        let entry = DownloadEntry::new_http(id.clone(), url, target_path);
 
         self.downloads.insert(id.clone(), entry);
         id

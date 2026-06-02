@@ -18,7 +18,9 @@ pub struct ResourceStats {
 /// - **Heavy load (>70%):** 1 worker per core to maintain system stability.
 ///
 /// Returns a [`ResourceStats`] struct containing the recommendation and current metrics.
-pub fn calculate_optimal_workers() -> ResourceStats {
+///
+/// `max_workers` caps the result (from `AppSettings`); defaults to 32 when `None`.
+pub fn calculate_optimal_workers(max_workers: Option<usize>) -> ResourceStats {
     let mut sys = System::new_all();
     sys.refresh_cpu_all();
 
@@ -41,9 +43,10 @@ pub fn calculate_optimal_workers() -> ResourceStats {
     };
 
     let suggested_workers = total_cores * multiplier;
+    let cap = max_workers.unwrap_or(32).max(1);
 
     ResourceStats {
-        suggested_workers: suggested_workers.clamp(1, 32), // Never < 1, and let's cap at 32 for safety
+        suggested_workers: suggested_workers.clamp(1, cap),
         cpu_usage: global_cpu_usage,
     }
 }
@@ -56,7 +59,7 @@ mod tests {
     fn test_calculate_optimal_workers() {
         // Goal: Ensure the worker calculation returns sane values across different system loads.
         
-        let stats = calculate_optimal_workers();
+        let stats = calculate_optimal_workers(Some(32));
         
         // Verify that we always have at least one worker and don't exceed our safety cap.
         assert!(stats.suggested_workers >= 1, "Suggested workers should never be less than 1");

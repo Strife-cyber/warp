@@ -1,42 +1,52 @@
 //! # Warp - High Performance Download Accelerator
-//!
-//! Warp is a multithreaded download manager designed to use system resources
-//! efficiently while ensuring download integrity through atomic progress tracking
-//! and a heartbeat-based snapshot system.
 
-pub mod ui;
 mod cli;
-mod engine;
-mod manager;
-mod segment;
-mod beat;
+mod core;
+mod daemon;
+mod download;
 mod download_registry;
-mod resources;
-mod utils;
+mod gui;
 mod hls;
-mod registry;
+mod metrics;
+mod pipeline;
+mod ui;
+mod utils;
 
 use clap::Parser;
 use cli::{Cli, Commands};
 
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
+fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
 
+    if matches!(cli.command, Commands::Gui | Commands::Tui) {
+        let rt = tokio::runtime::Runtime::new()?;
+        let registry = rt.block_on(download_registry::Registry::open())?;
+        return match cli.command {
+            Commands::Gui => gui::run_gui(registry),
+            Commands::Tui => ui::tui::run(registry),
+            _ => unreachable!(),
+        };
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(run_async(cli))
+}
+
+async fn run_async(cli: Cli) -> Result<(), anyhow::Error> {
     let registry = download_registry::Registry::open().await?;
 
     match cli.command {
         Commands::Add { url, output, speed_limit, proxy, checksum, priority } => {
             cli::handle_add(url, output, speed_limit, proxy, checksum, priority, &registry).await?;
         }
-        Commands::List => {
-            cli::handle_list(&registry).await?;
+        Commands::List { category, search } => {
+            cli::handle_list(&registry, category, search).await?;
         }
         Commands::Remove { id } => {
             cli::handle_remove(id, &registry).await?;
         }
         Commands::Run => {
-            engine::run_all(&registry).await?;
+            pipeline::run_all(&registry).await?;
         }
         Commands::Inspect { id } => {
             cli::handle_inspect(id, &registry).await?;
@@ -53,11 +63,20 @@ async fn main() -> Result<(), anyhow::Error> {
         Commands::Clean => {
             cli::handle_clean(&registry).await?;
         }
-        Commands::Tui => {
-            ui::tui::run(registry)?;
+        Commands::Gui => unreachable!("handled in main"),
+        Commands::Tui => unreachable!("handled in main"),
+        Commands::Serve { port } => {
+            daemon::serve(registry, port).await?;
+        }
+        Commands::Stats => {
+            cli::handle_stats(&registry).await?;
+        }
+        Commands::Config { global_speed_limit, max_workers } => {
+            cli::handle_config(global_speed_limit, max_workers, &registry).await?;
         }
         Commands::M3u8 { url, output, quality, concurrent } => {
-            hls::download_hls(&url, &output, quality, concurrent).await?;
+            let id = hls::download_hls_via_registry(&registry, &url, &output, quality, concurrent).await?;
+            println!("Added HLS download {id} — run `warp run` to start.");
         }
     }
 

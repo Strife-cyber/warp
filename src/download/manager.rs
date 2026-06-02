@@ -5,7 +5,8 @@ use crate::utils::HumanBytes;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use tokio::sync::{Mutex, Semaphore};
-use crate::segment::{download_worker, Chunk};
+use super::rate_limit::RunLimits;
+use super::segment::{download_worker, Chunk};
 
 /// Holds the essential metadata for a download session.
 pub struct Metadata {
@@ -79,54 +80,62 @@ pub struct Manager {
     pub target_path: std::path::PathBuf,
     /// Progress bar for this download.
     pb: Option<ProgressBar>,
+    /// Whether the server supports byte-range requests.
+    supports_range: bool,
 }
 
 impl Manager {
-    /// Fetches the Content-Length of a remote resource using a HEAD request.
-    async fn fetch_content_length(client: &reqwest::Client, url: &str) -> Result<u64, anyhow::Error> {
-        let response = client.head(url).send().await?;
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!("Failed to fetch content length for {}: Status {}", url, response.status()));
-        }
-        let size = response.headers()
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|val| val.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .ok_or_else(|| anyhow::anyhow!("Content-Length header missing or invalid for {}", url))?;
-        Ok(size)
-    }
-
     /// Initializes a Manager from a DownloadEntry, automatically attempting to resume.
-    pub async fn from_entry(entry: &crate::registry::DownloadEntry) -> Result<Self, anyhow::Error> {
+    pub async fn from_entry(entry: &crate::core::DownloadEntry) -> Result<Self, anyhow::Error> {
         let warp_path = entry.target_path.with_extension("warp");
-        
+
         let mut client_builder = reqwest::Client::builder();
         if let Some(ref proxy_url) = entry.proxy
-            && let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
-                client_builder = client_builder.proxy(proxy);
-            }
+            && let Ok(proxy) = reqwest::Proxy::all(proxy_url)
+        {
+            client_builder = client_builder.proxy(proxy);
+        }
         let client = Arc::new(client_builder.build()?);
 
-        let metadata = if warp_path.exists() {
-            match crate::beat::load_snapshot(&warp_path).await {
+        let (metadata, supports_range) = if warp_path.exists() {
+            match super::beat::load_snapshot(&warp_path).await {
                 Ok(mut m) => {
                     m.max_speed_bytes = entry.max_speed_bytes;
-                    m
-                },
+                    (m, true)
+                }
                 Err(e) => {
-                    eprintln!("Failed to load snapshot for {}: {}. Starting fresh.", entry.target_path.display(), e);
-                    let size = Self::fetch_content_length(&client, &entry.url).await?;
-                    Metadata::new(entry.url.clone(), size, entry.max_speed_bytes) 
+                    eprintln!(
+                        "Failed to load snapshot for {}: {}. Starting fresh.",
+                        entry.target_path.display(),
+                        e
+                    );
+                    let probe =
+                        super::probe::probe_url(&client, &entry.url, &entry.mirror_urls).await?;
+                    (
+                        Metadata::new(probe.effective_url, probe.size, entry.max_speed_bytes),
+                        probe.supports_range,
+                    )
                 }
             }
         } else {
-            let size = Self::fetch_content_length(&client, &entry.url).await?;
-            Metadata::new(entry.url.clone(), size, entry.max_speed_bytes) 
+            let probe = super::probe::probe_url(&client, &entry.url, &entry.mirror_urls).await?;
+            (
+                Metadata::new(probe.effective_url, probe.size, entry.max_speed_bytes),
+                probe.supports_range,
+            )
         };
 
-        Ok(Self::new(metadata, entry.target_path.clone(), client))
+        Ok(Self {
+            metadata: Arc::new(metadata),
+            client,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+            target_path: entry.target_path.clone(),
+            pb: None,
+            supports_range,
+        })
     }
 
+    #[cfg(test)]
     pub fn new(metadata: Metadata, target_path: std::path::PathBuf, client: Arc<reqwest::Client>) -> Self {
         Self {
             metadata: Arc::new(metadata),
@@ -134,6 +143,7 @@ impl Manager {
             cancel_token: tokio_util::sync::CancellationToken::new(),
             target_path,
             pb: None,
+            supports_range: true,
         }
     }
 
@@ -142,13 +152,34 @@ impl Manager {
     }
 
     /// Starts and manages the download lifecycle.
-    pub async fn run(&mut self, suggested_workers: usize, semaphore: Arc<Semaphore>) -> Result<(), anyhow::Error> {
+    pub async fn run(
+        &mut self,
+        suggested_workers: usize,
+        semaphore: Arc<Semaphore>,
+        limits: RunLimits,
+    ) -> Result<(), anyhow::Error> {
         if !self.target_path.exists() {
             let file = tokio::fs::File::create(&self.target_path).await?;
             file.set_len(self.metadata.size).await?;
         }
 
-        self.reconcile_chunks(suggested_workers).await;
+        let mut limits = limits;
+        if limits.local.is_none()
+            && let Some(b) = self.metadata.max_speed_bytes
+        {
+            limits.local = Some(Arc::new(super::rate_limit::RateLimiter::new(b)));
+        }
+
+        let worker_target = if self.supports_range {
+            suggested_workers
+        } else {
+            1
+        };
+        self.reconcile_chunks(worker_target).await;
+
+        let mut adaptive_target = worker_target;
+        let mut last_adapt = std::time::Instant::now();
+        let mut last_progress = self.metadata.total_progress().await;
 
         let hb_metadata = Arc::clone(&self.metadata);
         let hb_token = self.cancel_token.clone();
@@ -156,7 +187,7 @@ impl Manager {
         let hb_path_clone = hb_path.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = crate::beat::start_heartbeat_sync(hb_metadata, hb_token, &hb_path_clone).await {
+            if let Err(e) = super::beat::start_heartbeat_sync(hb_metadata, hb_token, &hb_path_clone).await {
                 eprintln!("Heartbeat failed: {}", e);
             }
         });
@@ -232,14 +263,24 @@ impl Manager {
                 let token = self.cancel_token.clone();
                 let meta = Arc::clone(&self.metadata);
                 let chunk_clone = Arc::clone(&chunk);
+                let limits = limits.clone();
+                let use_range = self.supports_range;
 
                 // Track as active
                 meta.active_chunks.lock().await.push(Arc::clone(&chunk));
 
                 workers.spawn(async move {
                     let _permit = _permit;
-                    let speed = meta.max_speed_bytes;
-                    let res = download_worker(client, path, chunk, url, token, speed).await;
+                    let res = download_worker(
+                        client,
+                        path,
+                        chunk,
+                        url,
+                        token,
+                        limits,
+                        use_range,
+                    )
+                    .await;
 
                     // Transition chunk based on result
                     let c_opt = {
@@ -274,7 +315,21 @@ impl Manager {
                         }
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    // Adaptive concurrency: grow chunk count when workers stay busy.
+                    if self.supports_range && last_adapt.elapsed() >= Duration::from_secs(3) {
+                        let prog = self.metadata.total_progress().await;
+                        let speed = prog.saturating_sub(last_progress);
+                        last_progress = prog;
+                        if !workers.is_empty() && speed > 0 {
+                            adaptive_target = (adaptive_target + 1)
+                                .min(suggested_workers * 2)
+                                .min(64);
+                            self.reconcile_chunks(adaptive_target).await;
+                        }
+                        last_adapt = std::time::Instant::now();
+                    }
+                }
             }
         }
 
@@ -366,19 +421,13 @@ mod tests {
             let chunks = metadata.chunks.lock().await;
             chunks[0].progress.store(2500, Ordering::SeqCst);
         }
-        crate::beat::save_snapshot_sync(&metadata, &warp_path).await.unwrap();
+        crate::download::beat::save_snapshot_sync(&metadata, &warp_path).await.unwrap();
 
-        let entry = crate::registry::DownloadEntry {
-            id: "test".to_string(),
-            url: "http://test.com".to_string(),
-            target_path: target_path.clone(),
-            status: crate::registry::DownloadStatus::Pending,
-            priority: 0,
-            proxy: None,
-            checksum: None,
-            max_speed_bytes: None,
-            error_message: None,
-        };
+        let entry = crate::core::DownloadEntry::new_http(
+            "test".to_string(),
+            "http://test.com".to_string(),
+            target_path.clone(),
+        );
 
         let manager = Manager::from_entry(&entry).await.unwrap();
         assert_eq!(manager.metadata.total_progress().await, 2500);
