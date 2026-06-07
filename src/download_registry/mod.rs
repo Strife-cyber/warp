@@ -161,6 +161,11 @@ impl Registry {
     pub async fn clean_completed(&self) -> Result<usize> {
         self.inner.clean_completed().await
     }
+
+    /// Atomically claim a download for processing.
+    pub async fn try_claim_download(&self, id: &str) -> Result<bool> {
+        self.inner.try_claim_download(id).await
+    }
 }
 
 fn default_db_path() -> Result<PathBuf> {

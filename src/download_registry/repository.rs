@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, anyhow};
 use tokio::fs;
 use async_trait::async_trait;
 use sqlx::SqlitePool;
@@ -201,6 +201,37 @@ impl Repository {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Atomically claim a download for processing — only succeeds if the
+    /// current status is `Pending` or `Paused`. This prevents two concurrent
+    /// `warp run` processes from both claiming the same download.
+    pub async fn try_claim_download(&self, id: &str) -> Result<bool> {
+        let rows = sqlx::query(
+            "UPDATE downloads SET status = ?, updated_at = CURRENT_TIMESTAMP \
+             WHERE id = ? AND status IN (?, ?)",
+        )
+        .bind(DownloadStatus::Downloading)
+        .bind(id)
+        .bind(DownloadStatus::Pending)
+        .bind(DownloadStatus::Paused)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if rows == 0 {
+            // Check whether the entry exists at all (vs. being claimed by another process).
+            let exists = sqlx::query_as::<_, (i64,)>("SELECT 1 FROM downloads WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?
+                .is_some();
+            if !exists {
+                return Err(anyhow!("download id {id} not found"));
+            }
+            Ok(false)
+        } else {
+            Ok(true)
+        }
     }
 }
 
