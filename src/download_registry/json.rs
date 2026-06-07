@@ -121,6 +121,25 @@ impl Registry {
     }
 
     pub fn clean_completed(&mut self) -> usize {
+        let completed_paths: Vec<_> = self
+            .downloads
+            .values()
+            .filter(|e| e.status == DownloadStatus::Completed)
+            .map(|e| e.target_path.clone())
+            .collect();
+
+        // Delete orphaned .warp / .hls.warp snapshot files.
+        for target in &completed_paths {
+            let warp = target.with_extension("warp");
+            if warp.exists() {
+                std::fs::remove_file(warp).ok();
+            }
+            let hls_warp = target.with_extension("hls.warp");
+            if hls_warp.exists() {
+                std::fs::remove_file(hls_warp).ok();
+            }
+        }
+
         let before = self.downloads.len();
         self.downloads
             .retain(|_, entry| entry.status != DownloadStatus::Completed);

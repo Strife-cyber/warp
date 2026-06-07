@@ -1,12 +1,25 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use tokio::fs;
 use async_trait::async_trait;
 use sqlx::SqlitePool;
 
 use crate::core::{
     DownloadCategory, DownloadEntry, DownloadKind, DownloadStatus,
 };
+
+/// Remove orphaned `.warp` / `.hls.warp` snapshot files for a given target path.
+async fn delete_warp_files(target: &Path) {
+    let warp = target.with_extension("warp");
+    if warp.exists() {
+        fs::remove_file(warp).await.ok();
+    }
+    let hls_warp = target.with_extension("hls.warp");
+    if hls_warp.exists() {
+        fs::remove_file(hls_warp).await.ok();
+    }
+}
 
 #[derive(sqlx::FromRow)]
 struct DownloadRecord {
@@ -231,6 +244,12 @@ const SELECT_NOT_COMPLETED: &str = concat!(
     "FROM downloads WHERE status != ? ORDER BY priority DESC, created_at ASC"
 );
 
+const SELECT_COMPLETED: &str = concat!(
+    "SELECT ",
+    "id, url, target_path, status, error_message, priority, proxy, checksum, max_speed_bytes, download_kind, category, hls_quality, hls_concurrent, scheduled_at, mirror_urls, post_action_json ",
+    "FROM downloads WHERE status = ? ORDER BY priority DESC, created_at ASC"
+);
+
 #[async_trait]
 impl DownloadRegistry for Repository {
     async fn add(&self, entry: DownloadEntry) -> Result<()> {
@@ -277,6 +296,9 @@ impl DownloadRegistry for Repository {
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
+        if let Some(ref entry) = record {
+            delete_warp_files(Path::new(&entry.target_path)).await;
+        }
         Ok(record.map(DownloadEntry::from))
     }
 
@@ -370,11 +392,24 @@ impl DownloadRegistry for Repository {
     }
 
     async fn clean_completed(&self) -> Result<usize> {
-        let result = sqlx::query("DELETE FROM downloads WHERE status = ?")
+        // Fetch completed entries first so we know which .warp files to delete.
+        let records = sqlx::query_as::<_, DownloadRecord>(SELECT_COMPLETED)
+            .bind(DownloadStatus::Completed)
+            .fetch_all(&self.pool)
+            .await?;
+
+        // Delete orphaned .warp / .hls.warp snapshot files.
+        for record in &records {
+            delete_warp_files(Path::new(&record.target_path)).await;
+        }
+
+        // Now delete the database entries.
+        sqlx::query("DELETE FROM downloads WHERE status = ?")
             .bind(DownloadStatus::Completed)
             .execute(&self.pool)
             .await?;
-        Ok(result.rows_affected() as usize)
+
+        Ok(records.len())
     }
 }
 
