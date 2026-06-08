@@ -31,7 +31,9 @@ pub async fn run_entry(
         .unwrap_or_else(|| "best".to_string());
     let max_concurrent = entry.hls_concurrent.unwrap_or(8) as usize;
 
-    let mut client_builder = reqwest::Client::builder().user_agent("Warp/0.2");
+    let mut client_builder = reqwest::Client::builder()
+        .user_agent("Warp/0.3")
+        .tcp_keepalive(Some(std::time::Duration::from_secs(30)));
     if let Some(ref proxy_url) = entry.proxy
         && let Ok(proxy) = reqwest::Proxy::all(proxy_url)
     {

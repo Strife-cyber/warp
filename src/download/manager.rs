@@ -25,10 +25,29 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    /// Creates fresh metadata for a new download.
-    pub fn new(url: String, size: u64, max_speed_bytes: Option<u64>) -> Self {
-        let mut chunks = VecDeque::new();
-        chunks.push_back(Arc::new(Chunk::new(0..=(size - 1), 0)));
+    /// Creates fresh metadata for a download, pre-split into `initial_chunks` pieces
+    /// so workers can start in parallel immediately instead of ramping up over seconds.
+    pub fn new(url: String, size: u64, max_speed_bytes: Option<u64>, initial_chunks: usize) -> Self {
+        let target = initial_chunks.max(1);
+        let chunk_size = size / target as u64;
+
+        let mut chunks = VecDeque::with_capacity(target);
+        let mut start = 0u64;
+        for i in 0..target {
+            let end = if i == target - 1 {
+                size - 1
+            } else {
+                start + chunk_size - 1
+            };
+            if start <= end {
+                chunks.push_back(Arc::new(Chunk::new(start..=end, 0)));
+            }
+            start = end + 1;
+        }
+
+        if chunks.is_empty() {
+            chunks.push_back(Arc::new(Chunk::new(0..=(size.saturating_sub(1)), 0)));
+        }
 
         Self {
             url,
@@ -89,7 +108,8 @@ impl Manager {
     pub async fn from_entry(entry: &crate::core::DownloadEntry) -> Result<Self, anyhow::Error> {
         let warp_path = entry.target_path.with_extension("warp");
 
-        let mut client_builder = reqwest::Client::builder();
+        let mut client_builder = reqwest::Client::builder()
+            .tcp_keepalive(Some(std::time::Duration::from_secs(30)));
         if let Some(ref proxy_url) = entry.proxy
             && let Ok(proxy) = reqwest::Proxy::all(proxy_url)
         {
@@ -112,7 +132,7 @@ impl Manager {
                     let probe =
                         super::probe::probe_url(&client, &entry.url, &entry.mirror_urls).await?;
                     (
-                        Metadata::new(probe.effective_url, probe.size, entry.max_speed_bytes),
+                        Metadata::new(probe.effective_url, probe.size, entry.max_speed_bytes, 1),
                         probe.supports_range,
                     )
                 }
@@ -120,7 +140,7 @@ impl Manager {
         } else {
             let probe = super::probe::probe_url(&client, &entry.url, &entry.mirror_urls).await?;
             (
-                Metadata::new(probe.effective_url, probe.size, entry.max_speed_bytes),
+                Metadata::new(probe.effective_url, probe.size, entry.max_speed_bytes, 16),
                 probe.supports_range,
             )
         };
@@ -199,7 +219,7 @@ impl Manager {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(500));
             let mut last_progress = log_metadata.total_progress().await;
-            
+
             if let Some(ref pbar) = pb {
                 pbar.set_position(last_progress);
             }
@@ -244,7 +264,7 @@ impl Manager {
                     if let Some(new_chunk) = self.try_steal_work().await {
                         queue.push_back(new_chunk);
                     } else if workers.is_empty() {
-                        break; 
+                        break;
                     }
                 }
 
@@ -298,7 +318,7 @@ impl Manager {
 
                     res
                 });
-                
+
                 // Continue loop immediately to spawn more workers if work and permits exist
                 continue;
             }
@@ -371,7 +391,7 @@ impl Manager {
     /// Attempts to steal work from one of the currently active worker chunks by splitting it.
     async fn try_steal_work(&self) -> Option<Arc<Chunk>> {
         let active = self.metadata.active_chunks.lock().await;
-        
+
         // Find the active chunk with the most remaining bytes to split.
         let mut best_target: Option<Arc<Chunk>> = None;
         let mut max_remaining = 0;
@@ -403,7 +423,7 @@ mod tests {
     async fn test_metadata_new() {
         let url = "http://example.com".to_string();
         let size = 1000;
-        let metadata = Metadata::new(url.clone(), size, None);
+        let metadata = Metadata::new(url.clone(), size, None, 1);
         assert_eq!(metadata.url, url);
         assert_eq!(metadata.size, size);
         let chunks = metadata.chunks.lock().await;
@@ -416,7 +436,7 @@ mod tests {
         let target_path = dir.path().join("download.zip");
         let warp_path = target_path.with_extension("warp");
 
-        let metadata = Metadata::new("http://test.com".to_string(), 5000, None);
+        let metadata = Metadata::new("http://test.com".to_string(), 5000, None, 1);
         {
             let chunks = metadata.chunks.lock().await;
             chunks[0].progress.store(2500, Ordering::SeqCst);
@@ -436,8 +456,8 @@ mod tests {
     #[tokio::test]
     async fn test_total_progress_with_completed_chunks() {
         let size = 1000;
-        let metadata = Metadata::new("url".to_string(), size, None);
-        
+        let metadata = Metadata::new("url".to_string(), size, None, 1);
+
         // 1. Initial progress is 0
         assert_eq!(metadata.total_progress().await, 0);
 
@@ -462,7 +482,7 @@ mod tests {
             active.pop();
         }
         metadata.completed_chunks.lock().await.push(chunk);
-        
+
         // Progress should STILL be 100
         assert_eq!(metadata.total_progress().await, 100);
     }
@@ -471,18 +491,18 @@ mod tests {
     async fn test_worker_failure_requeue() {
         let dir = tempdir().unwrap();
         let target_path = dir.path().join("test.bin");
-        let metadata = Metadata::new("url".to_string(), 1000, None);
+        let metadata = Metadata::new("url".to_string(), 1000, None, 1);
         let manager = Manager::new(metadata, target_path, Arc::new(reqwest::Client::new()));
-        
+
         let chunk = {
             let mut queue = manager.metadata.chunks.lock().await;
             queue.pop_front().unwrap()
         };
         let chunk_clone = Arc::clone(&chunk);
-        
+
         // Simulate worker starting
         manager.metadata.active_chunks.lock().await.push(Arc::clone(&chunk));
-        
+
         // Simulate worker failing
         {
             let mut active = manager.metadata.active_chunks.lock().await;
@@ -491,15 +511,14 @@ mod tests {
             // Re-queue
             manager.metadata.chunks.lock().await.push_back(c);
         }
-        
+
         // Verify it's back in the queue
         let queue = manager.metadata.chunks.lock().await;
         assert_eq!(queue.len(), 1);
         assert!(Arc::ptr_eq(&queue[0], &chunk_clone));
-        
+
         // Verify active is empty
         let active = manager.metadata.active_chunks.lock().await;
         assert!(active.is_empty());
     }
 }
-

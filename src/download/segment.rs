@@ -16,7 +16,7 @@ const WRITE_BUF_BYTES: usize = 256 * 1024;
 
 /// The minimum size in bytes for a chunk to be considered eligible for splitting.
 /// Smaller chunks are not split to avoid excessive HTTP overhead.
-pub const MIN_SPLIT_SIZE: u64 = 1024 * 1024 * 10; // 10MB minimum for splitting a chunk
+pub const MIN_SPLIT_SIZE: u64 = 1024 * 1024; // 1MB minimum for splitting a chunk
 
 /// Represents a range of bytes to download within a file.
 ///
@@ -67,9 +67,9 @@ impl Chunk {
         let current_end = *limits.end();
         let total_size = (current_end - current_start) + 1;
         let current_progress = self.progress.load(Ordering::SeqCst);
-        
+
         let remaining = total_size.saturating_sub(current_progress);
-        
+
         if remaining < MIN_SPLIT_SIZE * 2 {
             return None;
         }
@@ -83,7 +83,7 @@ impl Chunk {
 
         // Shrink the current chunk's end limit to just before the split point
         *limits = current_start..=(absolute_split_point - 1);
-        
+
         Some(new_chunk)
     }
 }
@@ -182,7 +182,7 @@ async fn perform_download(
                 tokio::time::sleep(Duration::from_secs(2u64.pow(retry_count))).await;
                 continue;
             }
-            return Err(anyhow::anyhow!("Server rejected Range request for {} (Status: {}). Bytes: {}-{}", 
+            return Err(anyhow::anyhow!("Server rejected Range request for {} (Status: {}). Bytes: {}-{}",
                 url, response.status(), absolute_start, end_offset));
         }
 
@@ -201,19 +201,19 @@ async fn perform_download(
                     return Err(e.into());
                 }
             };
-            
+
             // Reset retry count on successful packet
             retry_count = 0;
-            
+
             // 4. Re-check limits in case of a split during the stream
             let byte_limits = chunk.chunk_limits.lock().await;
             let current_end = *byte_limits.end();
             let current_abs_start = *byte_limits.start() + chunk.progress.load(Ordering::SeqCst);
-            
+
             if current_abs_start > current_end {
                 return Ok(());
             }
-            
+
             let bytes_to_write = if current_abs_start + packet.len() as u64 > current_end + 1 {
                 (current_end + 1 - current_abs_start) as usize
             } else {
@@ -229,12 +229,12 @@ async fn perform_download(
                 bytes_to_write as u64,
             )
             .await;
-            
+
             if bytes_to_write < packet.len() {
                 return Ok(());
             }
         }
-        
+
         let final_progress = chunk.progress.load(Ordering::SeqCst);
         let final_limits = chunk.chunk_limits.lock().await;
         if final_progress > (*final_limits.end() - *final_limits.start()) {
@@ -251,10 +251,10 @@ mod tests {
     async fn test_chunk_initialization() {
         // Goal: Ensure a Chunk is correctly initialized with the provided range and progress.
         let chunk = Chunk::new(0..=99, 10);
-        
+
         // Verify initial progress is stored correctly.
         assert_eq!(chunk.progress.load(Ordering::SeqCst), 10);
-        
+
         // Verify the byte range limits are set accurately.
         let limits = chunk.chunk_limits.lock().await;
         assert_eq!(*limits.start(), 0);
@@ -265,7 +265,7 @@ mod tests {
     async fn test_remaining_bytes() {
         // Goal: Verify the dynamic calculation of remaining bytes based on progress and range.
         let chunk = Chunk::new(0..=99, 0);
-        
+
         // Case 1: Fresh chunk (0 progress) should have full range remaining.
         assert_eq!(chunk.remaining_bytes().await, 100);
 
@@ -288,7 +288,7 @@ mod tests {
         // Range is 1MB, which is significantly less than the 20MB required for a split.
         let chunk = Arc::new(Chunk::new(0..=(1024 * 1024 - 1), 0));
         let new_chunk = chunk.split().await;
-        
+
         assert!(new_chunk.is_none(), "Chunk should not split if below size threshold");
     }
 
@@ -298,23 +298,23 @@ mod tests {
         // Range is 30MB (sufficient for a split).
         let total_size = 30 * 1024 * 1024;
         let chunk = Arc::new(Chunk::new(0..=(total_size - 1), 0));
-        
+
         let new_chunk = chunk.split().await.expect("Should split 30MB chunk");
-        
+
         let original_limits = chunk.chunk_limits.lock().await;
         let new_limits = new_chunk.chunk_limits.lock().await;
 
         // The split point should be at exactly 15MB (midpoint).
         let expected_split_point = 15 * 1024 * 1024;
-        
+
         // Original chunk should now cover the first 15MB.
         assert_eq!(*original_limits.start(), 0);
         assert_eq!(*original_limits.end(), (expected_split_point - 1) as u64);
-        
+
         // New chunk should cover the remaining 15MB.
         assert_eq!(*new_limits.start(), expected_split_point as u64);
         assert_eq!(*new_limits.end(), total_size - 1);
-        
+
         // New chunk must start with 0 progress.
         assert_eq!(new_chunk.progress.load(Ordering::SeqCst), 0);
     }
@@ -328,7 +328,7 @@ mod tests {
         let chunk = Arc::new(Chunk::new(0..=(total_size - 1), progress));
 
         let new_chunk = chunk.split().await.expect("Should split chunk with remaining 20MB");
-        
+
         let original_limits = chunk.chunk_limits.lock().await;
         let new_limits = new_chunk.chunk_limits.lock().await;
 
