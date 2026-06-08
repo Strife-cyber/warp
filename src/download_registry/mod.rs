@@ -166,6 +166,11 @@ impl Registry {
     pub async fn try_claim_download(&self, id: &str) -> Result<bool> {
         self.inner.try_claim_download(id).await
     }
+
+    /// Reset stalled `Downloading` entries to `Pending` so they can be retried.
+    pub async fn reclaim_stale_downloads(&self) -> Result<usize> {
+        self.inner.reclaim_stale_downloads().await
+    }
 }
 
 fn default_db_path() -> Result<PathBuf> {

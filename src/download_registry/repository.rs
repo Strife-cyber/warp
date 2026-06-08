@@ -206,6 +206,43 @@ impl Repository {
     /// Atomically claim a download for processing — only succeeds if the
     /// current status is `Pending` or `Paused`. This prevents two concurrent
     /// `warp run` processes from both claiming the same download.
+    /// Find downloads stuck in `Downloading` whose `.warp` heartbeat has gone
+    /// stale (>30s since last mod), and reset them to `Pending` so they can
+    /// be reclaimed by a new `warp run`.
+    pub async fn reclaim_stale_downloads(&self) -> Result<usize> {
+        let records = sqlx::query_as::<_, DownloadRecord>(SELECT_DOWNLOADING)
+            .bind(DownloadStatus::Downloading)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut reclaimed = 0usize;
+        for record in &records {
+            let target = Path::new(&record.target_path);
+            let stale = [target.with_extension("warp"), target.with_extension("hls.warp")]
+                .into_iter()
+                .filter(|p| p.exists())
+                .all(|p| {
+                    std::fs::metadata(&p)
+                        .and_then(|m| m.modified())
+                        .map(|t| t.elapsed().map(|d| d.as_secs() > 30).unwrap_or(true))
+                        .unwrap_or(true)
+                });
+
+            if stale {
+                sqlx::query(
+                    "UPDATE downloads SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                )
+                .bind(DownloadStatus::Pending)
+                .bind(&record.id)
+                .execute(&self.pool)
+                .await?;
+                reclaimed += 1;
+            }
+        }
+
+        Ok(reclaimed)
+    }
+
     pub async fn try_claim_download(&self, id: &str) -> Result<bool> {
         let rows = sqlx::query(
             "UPDATE downloads SET status = ?, updated_at = CURRENT_TIMESTAMP \
@@ -276,6 +313,12 @@ const SELECT_NOT_COMPLETED: &str = concat!(
 );
 
 const SELECT_COMPLETED: &str = concat!(
+    "SELECT ",
+    "id, url, target_path, status, error_message, priority, proxy, checksum, max_speed_bytes, download_kind, category, hls_quality, hls_concurrent, scheduled_at, mirror_urls, post_action_json ",
+    "FROM downloads WHERE status = ? ORDER BY priority DESC, created_at ASC"
+);
+
+const SELECT_DOWNLOADING: &str = concat!(
     "SELECT ",
     "id, url, target_path, status, error_message, priority, proxy, checksum, max_speed_bytes, download_kind, category, hls_quality, hls_concurrent, scheduled_at, mirror_urls, post_action_json ",
     "FROM downloads WHERE status = ? ORDER BY priority DESC, created_at ASC"

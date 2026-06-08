@@ -47,6 +47,12 @@ pub async fn run_all(registry: &Registry) -> Result<()> {
     let multi_progress = MultiProgress::new();
 
     loop {
+        // Reclaim downloads that were left in `Downloading` by a dead process.
+        let reclaimed = registry.reclaim_stale_downloads().await?;
+        if reclaimed > 0 {
+            println!("Reclaimed {reclaimed} stale download(s) with dead heartbeats.");
+        }
+
         let mut pending_downloads: Vec<_> = registry
             .list_not_completed()
             .await?
