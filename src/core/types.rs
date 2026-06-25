@@ -90,6 +90,9 @@ pub struct AppSettings {
     /// Upper bound on concurrent segment workers (auto-tuned below this).
     #[serde(default = "default_max_workers")]
     pub max_workers: usize,
+    /// Allow notifications (e.g. when a download is paused).
+    #[serde(default)]
+    pub allow_notifications: bool
 }
 
 fn default_max_workers() -> usize {
@@ -107,6 +110,7 @@ impl Default for AppSettings {
             global_max_speed_bytes: None,
             schedule_windows: Vec::new(),
             max_workers: default_max_workers(),
+            allow_notifications: true
         }
     }
 }

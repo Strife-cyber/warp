@@ -71,8 +71,8 @@ async fn run_async(cli: Cli) -> Result<(), anyhow::Error> {
         Commands::Stats => {
             cli::handle_stats(&registry).await?;
         }
-        Commands::Config { global_speed_limit, max_workers } => {
-            cli::handle_config(global_speed_limit, max_workers, &registry).await?;
+        Commands::Config { global_speed_limit, max_workers, allow_notifications } => {
+            cli::handle_config(global_speed_limit, max_workers, allow_notifications, &registry).await?;
         }
         Commands::M3u8 { url, output, quality, concurrent } => {
             let id = hls::download_hls_via_registry(&registry, &url, &output, quality, concurrent).await?;

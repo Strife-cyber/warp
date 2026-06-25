@@ -91,6 +91,9 @@ pub enum Commands {
         /// Max concurrent segment workers (default 32)
         #[arg(long)]
         max_workers: Option<usize>,
+        /// Allow desktop notifications (default true)
+        #[arg(long)]
+        allow_notifications: Option<bool>,
     },
     /// Downloads an HLS (M3U8) video stream
     M3u8 {
@@ -402,6 +405,7 @@ pub async fn handle_clean(registry: &Registry) -> Result<()> {
 pub async fn handle_config(
     global_speed_limit: Option<String>,
     max_workers: Option<usize>,
+    allow_notifications: Option<bool>,
     registry: &Registry,
 ) -> Result<()> {
     let mut settings = registry.get_settings().await?;
@@ -416,6 +420,10 @@ pub async fn handle_config(
             return Err(anyhow::anyhow!("max_workers must be at least 1"));
         }
         settings.max_workers = workers;
+        changed = true;
+    }
+    if let Some(allow) = allow_notifications {
+        settings.allow_notifications = allow;
         changed = true;
     }
 
@@ -435,6 +443,7 @@ pub async fn handle_config(
         }
         println!("max_workers: {}", settings.max_workers);
         println!("schedule_windows: {}", settings.schedule_windows.len());
+        println!("notifications allow: {}", settings.allow_notifications);
     }
 
     Ok(())
