@@ -5,10 +5,12 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+use notify_rust::{Notification, Urgency};
+
 use crate::core::DownloadStatus;
 use crate::download::{calculate_optimal_workers, rate_limit::RateLimiter};
 use crate::download_registry::Registry;
-use crate::pipeline::executor::{execute_entry, EngineContext};
+use crate::pipeline::executor::{EngineContext, execute_entry};
 use crate::pipeline::post_action::{maybe_shutdown, run_post_download};
 use crate::pipeline::scheduler::{is_entry_ready, is_within_schedule, next_schedule_wait};
 
@@ -62,7 +64,10 @@ pub async fn run_all(registry: &Registry) -> Result<()> {
         pending_downloads.sort_by(|a, b| b.priority.cmp(&a.priority));
 
         if pending_downloads.is_empty() {
-            println!("No pending downloads — checking again in {}s...", POLL_INTERVAL.as_secs());
+            println!(
+                "No pending downloads — checking again in {}s...",
+                POLL_INTERVAL.as_secs()
+            );
             tokio::time::sleep(POLL_INTERVAL).await;
             continue;
         }
@@ -138,7 +143,37 @@ pub async fn run_all(registry: &Registry) -> Result<()> {
 
         while let Some(res) = managers.join_next().await {
             match res {
-                Ok((id, status, err, _entry)) => {
+                Ok((id, status, err, entry)) => {
+                    let filename = entry
+                        .target_path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    if settings.allow_notifications {
+                        let err_display = err.as_deref().unwrap_or("unknown error");
+                        match status {
+                            DownloadStatus::Completed => {
+                                let _ = Notification::new()
+                                    .summary("Download Complete")
+                                    .body(&filename)
+                                    .icon("dialog-information")
+                                    .appname("Warp")
+                                    .show();
+                            }
+                            DownloadStatus::Error => {
+                                let _ = Notification::new()
+                                    .summary("Download Failed")
+                                    .body(&format!("{filename} — {err_display}"))
+                                    .icon("dialog-error")
+                                    .appname("Warp")
+                                    .urgency(Urgency::Critical)
+                                    .show();
+                            }
+                            _ => {}
+                        }
+                    }
+
                     registry.update_status(&id, status.clone()).await?;
                     if let Some(msg) = err {
                         if let Some(mut e) = registry.get(&id).await? {
@@ -148,6 +183,19 @@ pub async fn run_all(registry: &Registry) -> Result<()> {
                     }
                 }
                 Err(e) => eprintln!("Manager task panicked: {e}"),
+            }
+        }
+
+        if settings.allow_notifications {
+            let remaining = registry.list_not_completed().await?;
+            if remaining.is_empty() {
+                let _ = Notification::new()
+                    .summary("All Downloads Complete")
+                    .body("The download queue is fully finished")
+                    .icon("dialog-information")
+                    .appname("Warp")
+                    .timeout(5000)
+                    .show();
             }
         }
 
