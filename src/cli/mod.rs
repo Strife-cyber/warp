@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use crate::download_registry::Registry;
 use crate::core::DownloadStatus;
 use clap::{Parser, Subcommand};
+use crate::utils::format_size;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -174,9 +175,11 @@ pub async fn handle_list(
     search: Option<String>,
 ) -> Result<()> {
     let cat = category.as_deref().and_then(parse_category);
+
     let entries = registry
         .list_filtered(cat, search.as_deref())
         .await?;
+
     if entries.is_empty() {
         println!("No downloads in download_registry.");
         return Ok(());
@@ -186,27 +189,54 @@ pub async fn handle_list(
     let status_w = 12;
     let target_w = 45;
     let url_w = 50;
+    let progress_w = 12;
+    let downloaded_w = 35;
 
     println!(
-        "{:<id_w$} | {:<status_w$} | {:<target_w$} | {:<url_w$}",
-        "ID", "Status", "Target", "URL",
-        id_w=id_w, status_w=status_w, target_w=target_w, url_w=url_w
+        "{:<id_w$} | {:<status_w$} | {:<target_w$} | {:<url_w$} | {:<progress_w$} | {:<downloaded_w$}",
+        "ID",
+        "Status",
+        "Target",
+        "URL",
+        "Progress %",
+        "Downloaded / Total",
+        id_w = id_w,
+        status_w = status_w,
+        target_w = target_w,
+        url_w = url_w,
+        progress_w = progress_w,
+        downloaded_w = downloaded_w,
     );
+
     println!(
-        "{:-<id_w$}-+-{:-<status_w$}-+-{:-<target_w$}-+-{:-<url_w$}",
-        "", "", "", "",
-        id_w=id_w, status_w=status_w, target_w=target_w, url_w=url_w
+        "{:-<id_w$}-+-{:-<status_w$}-+-{:-<target_w$}-+-{:-<url_w$}-+-{:-<progress_w$}-+-{:-<downloaded_w$}",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        id_w = id_w,
+        status_w = status_w,
+        target_w = target_w,
+        url_w = url_w,
+        progress_w = progress_w,
+        downloaded_w = downloaded_w,
     );
 
     for entry in entries {
         let status_str = match &entry.status {
             DownloadStatus::Error => "Error".to_string(),
-            s => format!("{:?}", s),
+            status => format!("{status:?}"),
         };
 
         let target_str = entry.target_path.to_string_lossy();
+
         let display_target = if target_str.len() > target_w {
-            format!("...{}", &target_str[target_str.len() - (target_w - 3)..])
+            format!(
+                "...{}",
+                &target_str[target_str.len() - (target_w - 3)..]
+            )
         } else {
             target_str.to_string()
         };
@@ -217,15 +247,54 @@ pub async fn handle_list(
             entry.url.clone()
         };
 
+        let warp_path = entry.target_path.with_extension("warp");
+
+        let (progress_str, downloaded_str) = if warp_path.exists() {
+            let snapshot =
+                crate::download::beat::load_warp_file(&warp_path).await?;
+
+            let total = snapshot.size;
+            let downloaded: u64 =
+                snapshot.chunks.iter().map(|c| c.progress).sum();
+
+            let progress = if total > 0 {
+                (downloaded as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            (
+                format!("{progress:.1}%"),
+                format!(
+                    "{} / {}",
+                    format_size(downloaded),
+                    format_size(total)
+                ),
+            )
+        } else {
+            (
+                "-".to_string(),
+                "- / -".to_string(),
+            )
+        };
+
         println!(
-            "{:<id_w$} | {:<status_w$} | {:<target_w$} | {:<url_w$}",
+            "{:<id_w$} | {:<status_w$} | {:<target_w$} | {:<url_w$} | {:<progress_w$} | {:<downloaded_w$}",
             entry.id,
             status_str,
             display_target,
             display_url,
-            id_w=id_w, status_w=status_w, target_w=target_w, url_w=url_w
+            progress_str,
+            downloaded_str,
+            id_w = id_w,
+            status_w = status_w,
+            target_w = target_w,
+            url_w = url_w,
+            progress_w = progress_w,
+            downloaded_w = downloaded_w,
         );
     }
+
     Ok(())
 }
 
