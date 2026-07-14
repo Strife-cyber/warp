@@ -24,10 +24,11 @@ pub const MIN_SPLIT_SIZE: u64 = 1024 * 1024; // 1MB minimum for splitting a chun
 /// multiple tasks to track progress and can be split into smaller chunks to
 /// balance work between idle workers.
 pub struct Chunk {
-    /// The absolute byte range (inclusive) within the target file.
-    /// Protected by a Mutex because it can be modified during a split operation
-    /// while a worker is actively downloading it.
-    pub chunk_limits: tokio::sync::Mutex<std::ops::RangeInclusive<u64>>,
+    /// Start byte — immutable after creation.
+    pub start: u64,
+    /// End byte (inclusive) — Atomic so the hot-path per-packet check avoids
+    /// a Mutex acquisition.  Only shrunk during a split.
+    pub end: AtomicU64,
     /// The number of bytes successfully written to the file for this chunk.
     /// Uses AtomicU64 to allow safe, lock-free progress tracking from the worker
     /// while other tasks (like the heartbeat) read it.
@@ -38,7 +39,8 @@ impl Chunk {
     /// Creates a new Chunk with the specified range and initial progress.
     pub fn new(range: std::ops::RangeInclusive<u64>, progress: u64) -> Self {
         Self {
-            chunk_limits: tokio::sync::Mutex::new(range),
+            start: *range.start(),
+            end: AtomicU64::new(*range.end()),
             progress: AtomicU64::new(progress),
         }
     }
@@ -47,11 +49,9 @@ impl Chunk {
     ///
     /// This calculation is dynamic and reflects both current progress and
     /// any range adjustments caused by splitting.
-    pub async fn remaining_bytes(&self) -> u64 {
-        let limits = self.chunk_limits.lock().await;
-        let total_size = (*limits.end() - *limits.start()) + 1;
-        let p = self.progress.load(Ordering::SeqCst);
-        total_size.saturating_sub(p)
+    pub fn remaining_bytes(&self) -> u64 {
+        let total_size = (self.end.load(Ordering::Relaxed) - self.start) + 1;
+        total_size.saturating_sub(self.progress.load(Ordering::Relaxed))
     }
 
     /// Attempts to split the remaining work of this chunk into two separate chunks.
@@ -61,12 +61,10 @@ impl Chunk {
     /// is returned representing the latter half.
     ///
     /// Returns `None` if the remaining work is smaller than `MIN_SPLIT_SIZE * 2`.
-    pub async fn split(self: &Arc<Self>) -> Option<Arc<Self>> {
-        let mut limits = self.chunk_limits.lock().await;
-        let current_start = *limits.start();
-        let current_end = *limits.end();
-        let total_size = (current_end - current_start) + 1;
-        let current_progress = self.progress.load(Ordering::SeqCst);
+    pub fn split(self: &Arc<Self>) -> Option<Arc<Self>> {
+        let current_end = self.end.load(Ordering::Acquire);
+        let total_size = (current_end - self.start) + 1;
+        let current_progress = self.progress.load(Ordering::Acquire);
 
         let remaining = total_size.saturating_sub(current_progress);
 
@@ -75,14 +73,13 @@ impl Chunk {
         }
 
         // Calculate the absolute midpoint of the REMAINING work
-        let split_offset = current_progress + (remaining / 2);
-        let absolute_split_point = current_start + split_offset;
+        let absolute_split_point = self.start + current_progress + (remaining / 2);
 
         // Create a new chunk for the latter half, starting with 0 progress
         let new_chunk = Arc::new(Chunk::new(absolute_split_point..=current_end, 0));
 
         // Shrink the current chunk's end limit to just before the split point
-        *limits = current_start..=(absolute_split_point - 1);
+        self.end.store(absolute_split_point - 1, Ordering::Release);
 
         Some(new_chunk)
     }
@@ -140,9 +137,8 @@ async fn perform_download(
     loop {
         // 1. Fetch current limits and progress. This handle resumes.
         let (start_offset, end_offset, current_progress) = {
-            let limits = chunk.chunk_limits.lock().await;
-            let cp = chunk.progress.load(Ordering::SeqCst);
-            (*limits.start(), *limits.end(), cp)
+            let cp = chunk.progress.load(Ordering::Acquire);
+            (chunk.start, chunk.end.load(Ordering::Acquire), cp)
         };
 
         let absolute_start = start_offset + current_progress;
@@ -188,6 +184,7 @@ async fn perform_download(
 
         // 3. Process the byte stream
         let mut stream = response.bytes_stream();
+        let mut bytes_since_flush = 0u64;
 
         while let Some(item) = stream.next().await {
             let packet = match item {
@@ -205,10 +202,10 @@ async fn perform_download(
             // Reset retry count on successful packet
             retry_count = 0;
 
-            // 4. Re-check limits in case of a split during the stream
-            let byte_limits = chunk.chunk_limits.lock().await;
-            let current_end = *byte_limits.end();
-            let current_abs_start = *byte_limits.start() + chunk.progress.load(Ordering::SeqCst);
+            // 4. Re-check limits in case of a split during the stream.
+            //    Uses atomic loads — no Mutex in the hot path.
+            let current_end = chunk.end.load(Ordering::Acquire);
+            let current_abs_start = chunk.start + chunk.progress.load(Ordering::Acquire);
 
             if current_abs_start > current_end {
                 return Ok(());
@@ -221,7 +218,18 @@ async fn perform_download(
             };
 
             handle.write_all(&packet[..bytes_to_write]).await?;
-            chunk.progress.fetch_add(bytes_to_write as u64, Ordering::SeqCst);
+            chunk.progress.fetch_add(bytes_to_write as u64, Ordering::Release);
+
+            // Periodically flush so a crash can't lose more than ~1 MB of
+            // recently-received data per worker.  Without this the BufWriter
+            // only flushes when its 256 KB buffer is full or at worker exit —
+            // fine for throughput, but bad for resume accuracy since the
+            // heartbeat snapshot counts bytes written before they hit disk.
+            bytes_since_flush += bytes_to_write as u64;
+            if bytes_since_flush >= 1024 * 1024 {
+                handle.flush().await?;
+                bytes_since_flush = 0;
+            }
 
             acquire_composed(
                 limits.global.as_ref(),
@@ -235,9 +243,9 @@ async fn perform_download(
             }
         }
 
-        let final_progress = chunk.progress.load(Ordering::SeqCst);
-        let final_limits = chunk.chunk_limits.lock().await;
-        if final_progress > (*final_limits.end() - *final_limits.start()) {
+        let final_progress = chunk.progress.load(Ordering::Acquire);
+        let final_end = chunk.end.load(Ordering::Acquire);
+        if final_progress > (final_end - chunk.start) {
             return Ok(());
         }
     }
@@ -252,91 +260,173 @@ mod tests {
         // Goal: Ensure a Chunk is correctly initialized with the provided range and progress.
         let chunk = Chunk::new(0..=99, 10);
 
-        // Verify initial progress is stored correctly.
-        assert_eq!(chunk.progress.load(Ordering::SeqCst), 10);
+        assert_eq!(chunk.progress.load(Ordering::Relaxed), 10);
+        assert_eq!(chunk.start, 0);
+        assert_eq!(chunk.end.load(Ordering::Relaxed), 99);
+    }
 
-        // Verify the byte range limits are set accurately.
-        let limits = chunk.chunk_limits.lock().await;
-        assert_eq!(*limits.start(), 0);
-        assert_eq!(*limits.end(), 99);
+    #[tokio::test]
+    async fn test_chunk_single_byte_range() {
+        // Edge case: range where start == end (single byte).
+        let chunk = Chunk::new(42..=42, 0);
+        assert_eq!(chunk.remaining_bytes(), 1);
+        assert_eq!(chunk.start, 42);
+        assert_eq!(chunk.end.load(Ordering::Relaxed), 42);
+
+        // Mark as complete
+        chunk.progress.store(1, Ordering::Relaxed);
+        assert_eq!(chunk.remaining_bytes(), 0);
     }
 
     #[tokio::test]
     async fn test_remaining_bytes() {
-        // Goal: Verify the dynamic calculation of remaining bytes based on progress and range.
         let chunk = Chunk::new(0..=99, 0);
 
-        // Case 1: Fresh chunk (0 progress) should have full range remaining.
-        assert_eq!(chunk.remaining_bytes().await, 100);
+        // Case 1: Fresh chunk should have full range remaining.
+        assert_eq!(chunk.remaining_bytes(), 100);
 
         // Case 2: Partial progress.
-        chunk.progress.store(50, Ordering::SeqCst);
-        assert_eq!(chunk.remaining_bytes().await, 50);
+        chunk.progress.store(50, Ordering::Relaxed);
+        assert_eq!(chunk.remaining_bytes(), 50);
 
         // Case 3: Fully completed chunk.
-        chunk.progress.store(100, Ordering::SeqCst);
-        assert_eq!(chunk.remaining_bytes().await, 0);
+        chunk.progress.store(100, Ordering::Relaxed);
+        assert_eq!(chunk.remaining_bytes(), 0);
 
-        // Case 4: Progress exceeding range (should be clamped to 0 remaining).
-        chunk.progress.store(150, Ordering::SeqCst);
-        assert_eq!(chunk.remaining_bytes().await, 0);
+        // Case 4: Progress exceeding range (should be clamped to 0).
+        chunk.progress.store(150, Ordering::Relaxed);
+        assert_eq!(chunk.remaining_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_remaining_bytes_after_atomic_shrink() {
+        // Simulates: chunk is partially downloaded, then a split shrinks `end`.
+        // remaining_bytes() should reflect the new range, not the original.
+        let chunk = Arc::new(Chunk::new(0..=99, 20));
+
+        // Manually shrink end (as split() would).
+        chunk.end.store(49, Ordering::Release);
+
+        // 30 remaining: (49 - 0 + 1) - 20 = 30
+        assert_eq!(chunk.remaining_bytes(), 30);
+
+        // Progress past new end.
+        chunk.progress.store(60, Ordering::Relaxed);
+        assert_eq!(chunk.remaining_bytes(), 0);
     }
 
     #[tokio::test]
     async fn test_chunk_split_too_small() {
-        // Goal: Ensure chunks below the MIN_SPLIT_SIZE threshold are NOT split.
-        // Range is 1MB, which is significantly less than the 20MB required for a split.
+        // Chunks below MIN_SPLIT_SIZE × 2 must NOT be split.
         let chunk = Arc::new(Chunk::new(0..=(1024 * 1024 - 1), 0));
-        let new_chunk = chunk.split().await;
+        let new_chunk = chunk.split();
 
         assert!(new_chunk.is_none(), "Chunk should not split if below size threshold");
     }
 
     #[tokio::test]
+    async fn test_chunk_split_at_exact_boundary() {
+        // Exactly at MIN_SPLIT_SIZE × 2 — should split.
+        let size = 2 * MIN_SPLIT_SIZE;
+        let chunk = Arc::new(Chunk::new(0..=(size - 1), 0));
+        let new_chunk = chunk.split();
+
+        assert!(new_chunk.is_some(), "Chunk at exact boundary should split");
+        let new_chunk = new_chunk.unwrap();
+
+        // Split point should be at MIN_SPLIT_SIZE.
+        assert_eq!(chunk.end.load(Ordering::Relaxed), MIN_SPLIT_SIZE - 1);
+        assert_eq!(new_chunk.start, MIN_SPLIT_SIZE);
+        assert_eq!(new_chunk.end.load(Ordering::Relaxed), size - 1);
+    }
+
+    #[tokio::test]
     async fn test_chunk_split_success() {
-        // Goal: Verify a successful split of a large chunk into two halves.
-        // Range is 30MB (sufficient for a split).
         let total_size = 30 * 1024 * 1024;
         let chunk = Arc::new(Chunk::new(0..=(total_size - 1), 0));
 
-        let new_chunk = chunk.split().await.expect("Should split 30MB chunk");
+        let new_chunk = chunk.split().expect("Should split 30MB chunk");
 
-        let original_limits = chunk.chunk_limits.lock().await;
-        let new_limits = new_chunk.chunk_limits.lock().await;
-
-        // The split point should be at exactly 15MB (midpoint).
         let expected_split_point = 15 * 1024 * 1024;
 
-        // Original chunk should now cover the first 15MB.
-        assert_eq!(*original_limits.start(), 0);
-        assert_eq!(*original_limits.end(), (expected_split_point - 1) as u64);
-
-        // New chunk should cover the remaining 15MB.
-        assert_eq!(*new_limits.start(), expected_split_point as u64);
-        assert_eq!(*new_limits.end(), total_size - 1);
-
-        // New chunk must start with 0 progress.
-        assert_eq!(new_chunk.progress.load(Ordering::SeqCst), 0);
+        assert_eq!(chunk.start, 0);
+        assert_eq!(chunk.end.load(Ordering::Relaxed), (expected_split_point - 1) as u64);
+        assert_eq!(new_chunk.start, expected_split_point as u64);
+        assert_eq!(new_chunk.end.load(Ordering::Relaxed), total_size - 1);
+        assert_eq!(new_chunk.progress.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn test_chunk_split_with_progress() {
-        // Goal: Verify that a split correctly accounts for current progress.
-        // Range 0..=30MB, but 10MB already downloaded. 20MB remaining.
+        // 30 MB range, 10 MB already written → split the remaining 20 MB.
         let total_size = 30 * 1024 * 1024;
         let progress = 10 * 1024 * 1024;
         let chunk = Arc::new(Chunk::new(0..=(total_size - 1), progress));
 
-        let new_chunk = chunk.split().await.expect("Should split chunk with remaining 20MB");
+        let new_chunk = chunk.split().expect("Should split chunk with remaining 20MB");
 
-        let original_limits = chunk.chunk_limits.lock().await;
-        let new_limits = new_chunk.chunk_limits.lock().await;
-
-        // The split should happen in the MIDDLE of the REMAINING 20MB.
-        // Split point = progress (10MB) + half-remaining (10MB) = 20MB.
+        // Split point = 10 MB (progress) + 10 MB (half of 20 MB remaining) = 20 MB.
         let expected_split_point = 20 * 1024 * 1024;
 
-        assert_eq!(*original_limits.end(), (expected_split_point - 1) as u64);
-        assert_eq!(*new_limits.start(), expected_split_point as u64);
+        assert_eq!(chunk.end.load(Ordering::Relaxed), (expected_split_point - 1) as u64);
+        assert_eq!(new_chunk.start, expected_split_point as u64);
+    }
+
+    #[tokio::test]
+    async fn test_chunk_split_preserves_start_immutable() {
+        // After split, `start` must never change — only `end` shrinks.
+        let chunk = Arc::new(Chunk::new(500..=999, 0));
+        chunk.split();
+
+        assert_eq!(chunk.start, 500, "start must never change after split");
+
+        // Split again from the new (smaller) chunk.
+        chunk.split();
+        assert_eq!(chunk.start, 500, "start must never change after second split");
+    }
+
+    #[tokio::test]
+    async fn test_chunk_multiple_sequential_splits() {
+        // Split a large chunk repeatedly until it refuses to split further.
+        let size = 20 * MIN_SPLIT_SIZE; // 20 MB
+        let chunk = Arc::new(Chunk::new(0..=(size - 1), 0));
+
+        let mut splits = 0;
+        let mut current = Arc::clone(&chunk);
+        while let Some(new_chunk) = current.split() {
+            splits += 1;
+            // The original (left) chunk's end should never overlap with new (right).
+            assert!(current.end.load(Ordering::Relaxed) < new_chunk.start,
+                    "Split chunks must not overlap: left end {} < right start {}",
+                    current.end.load(Ordering::Relaxed), new_chunk.start);
+            // The two ranges must cover a contiguous region with no gap.
+            assert_eq!(current.end.load(Ordering::Relaxed) + 1, new_chunk.start,
+                    "Split chunks must be contiguous with no gap");
+            current = new_chunk;
+        }
+
+        // At 20 MB with 1 MB minimum, we should get ~10 splits (log₂).
+        assert!(splits >= 3, "Should get multiple splits, got {splits}");
+        // All splits combined must cover exactly the original range.
+        // Last chunk covers from its start to `size - 1`. First chunk starts at 0.
+        assert_eq!(chunk.start, 0);
+        assert_eq!(current.end.load(Ordering::Relaxed), size - 1);
+    }
+
+    #[tokio::test]
+    async fn test_chunk_split_with_large_progress_resume_margin_scenario() {
+        // Simulates the scenario after a resume margin has been applied:
+        // progress = 1 GB, range = 2 GB, remaining = 1 GB — split should work.
+        let total_size = 2u64 * 1024 * 1024 * 1024; // 2 GB
+        let progress = 1u64 * 1024 * 1024 * 1024;   // 1 GB
+        let chunk = Arc::new(Chunk::new(0..=(total_size - 1), progress));
+
+        let new_chunk = chunk.split().expect("Should split 2 GB chunk with 50% progress");
+
+        // Split point = progress (1 GB) + half-remaining (512 MB) = 1.5 GB
+        let expected = 1u64 * 1024 * 1024 * 1024 + 512 * 1024 * 1024;
+        assert_eq!(chunk.end.load(Ordering::Relaxed), expected - 1);
+        assert_eq!(new_chunk.start, expected);
+        assert_eq!(new_chunk.end.load(Ordering::Relaxed), total_size - 1);
     }
 }

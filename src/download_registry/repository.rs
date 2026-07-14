@@ -9,7 +9,7 @@ use crate::core::{
     DownloadCategory, DownloadEntry, DownloadKind, DownloadStatus,
 };
 
-/// Remove orphaned `.warp` / `.hls.warp` snapshot files for a given target path.
+/// Remove orphaned snapshot and part files for a given target path.
 async fn delete_warp_files(target: &Path) {
     let warp = target.with_extension("warp");
     if warp.exists() {
@@ -18,6 +18,14 @@ async fn delete_warp_files(target: &Path) {
     let hls_warp = target.with_extension("hls.warp");
     if hls_warp.exists() {
         fs::remove_file(hls_warp).await.ok();
+    }
+    let warpart = target.with_extension("warpart");
+    if warpart.exists() {
+        fs::remove_file(warpart).await.ok();
+    }
+    let hlspart = target.with_extension("hlspart");
+    if hlspart.exists() {
+        fs::remove_file(hlspart).await.ok();
     }
 }
 

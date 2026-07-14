@@ -49,18 +49,23 @@ async fn probe_single(client: &Client, url: &str) -> Result<ProbeResult> {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
 
+    let range_result = verify_range(client, url, head_size).await?;
+
     if accept_ranges {
-        if let Some(size) = verify_range(client, url, head_size).await? {
+        if let Some(size) = range_result {
             return Ok(ProbeResult {
                 effective_url: url.to_string(),
                 size,
                 supports_range: true,
             });
         }
+        // range_result was None despite accept_ranges — fall through to
+        // the non-range fallback below (no redundant HTTP call).
     }
 
-    // Fallback: full GET with Range 0-0 to learn total from Content-Range
-    if let Some(size) = verify_range(client, url, head_size).await? {
+    // Fallback: use the cached range_result (None when accept_ranges was
+    // true, or the actual value when accept_ranges was false).
+    if let Some(size) = range_result {
         return Ok(ProbeResult {
             effective_url: url.to_string(),
             size,

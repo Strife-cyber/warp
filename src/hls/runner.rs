@@ -101,8 +101,10 @@ pub async fn run_entry(
         }
     }
 
-    // Concatenate parts in order into the final output file.
-    let mut output = tokio::fs::File::create(&entry.target_path).await?;
+    // Concatenate parts in order into a temp file, then atomically rename.
+    // This prevents a partial .ts file if the process dies mid-concatenation.
+    let concat_path = entry.target_path.with_extension("hlspart");
+    let mut output = tokio::fs::File::create(&concat_path).await?;
     let mut bytes_total = 0u64;
     for i in 0..total {
         let part = parts_dir.join(format!("{i:06}.part"));
@@ -114,6 +116,7 @@ pub async fn run_entry(
         }
     }
     output.flush().await?;
+    tokio::fs::rename(&concat_path, &entry.target_path).await?;
     let _ = tokio::fs::remove_dir(&parts_dir).await;
     let _ = tokio::fs::remove_file(&snapshot_path).await;
 

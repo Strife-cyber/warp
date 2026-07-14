@@ -58,6 +58,13 @@ impl Registry {
     ) -> Result<String> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
+        let target_path = if target_path.is_relative() {
+            std::path::absolute(&target_path)
+                .context("failed to resolve relative HLS target path")?
+        } else {
+            target_path
+        };
+
         let id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("system clock before UNIX epoch")?
@@ -71,6 +78,17 @@ impl Registry {
 
     pub async fn add(&self, url: String, target_path: PathBuf) -> Result<String> {
         use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Resolve relative paths to absolute so that later commands (list,
+        // inspect, clean, …) work from any working directory.  Using
+        // std::path::absolute (not canonicalize) means the file doesn't have
+        // to exist yet — it's just a path resolution, not a filesystem lookup.
+        let target_path = if target_path.is_relative() {
+            std::path::absolute(&target_path)
+                .context("failed to resolve relative target path")?
+        } else {
+            target_path
+        };
 
         let id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -256,6 +274,54 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, id);
         assert_eq!(entries[0].category, crate::core::DownloadCategory::Other);
+    }
+
+    #[tokio::test]
+    async fn test_registry_canonicalizes_relative_path() {
+        // Relative paths must be stored as absolute so all commands (list,
+        // inspect, clean) work from any working directory.
+        let registry = Registry::open_in_memory().await.unwrap();
+        let id = registry
+            .add("http://example.com".to_string(), PathBuf::from("relative.zip"))
+            .await
+            .unwrap();
+
+        let entry = registry.get(&id).await.unwrap().unwrap();
+        assert!(entry.target_path.is_absolute(),
+                "target_path must be absolute, got: {}", entry.target_path.display());
+        assert!(entry.target_path.to_string_lossy().contains("relative.zip"),
+                "filename must be preserved in the absolute path");
+    }
+
+    #[tokio::test]
+    async fn test_registry_preserves_absolute_path() {
+        // Already-absolute paths must not be altered.
+        let registry = Registry::open_in_memory().await.unwrap();
+        let abs = std::path::absolute("preserved.bin").unwrap();
+        let id = registry
+            .add("http://example.com".to_string(), abs.clone())
+            .await
+            .unwrap();
+
+        let entry = registry.get(&id).await.unwrap().unwrap();
+        assert_eq!(entry.target_path, abs);
+    }
+
+    #[tokio::test]
+    async fn test_registry_add_hls_canonicalizes() {
+        // HLS downloads should also canonicalize paths.
+        let registry = Registry::open_in_memory().await.unwrap();
+        let id = registry
+            .add_hls("http://example.com/playlist.m3u8".to_string(),
+                     PathBuf::from("hls_output.ts"),
+                     Some("best".to_string()),
+                     Some(4))
+            .await
+            .unwrap();
+
+        let entry = registry.get(&id).await.unwrap().unwrap();
+        assert!(entry.target_path.is_absolute(),
+                "HLS target_path must be absolute, got: {}", entry.target_path.display());
     }
 
     #[tokio::test]

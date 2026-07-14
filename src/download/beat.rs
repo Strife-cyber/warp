@@ -68,10 +68,17 @@ pub async fn start_heartbeat_sync(
 pub async fn load_snapshot(target_path: &Path) -> Result<Metadata, anyhow::Error> {
     let snapshot = load_warp_file(target_path).await?;
 
+    // Safety margin: on crash, the last ~1 MB per worker may have been
+    // counted in progress (heartbeat snapshot) but still sat in the
+    // BufWriter buffer, never reaching disk.  Pull progress back by
+    // RESUME_MARGIN bytes so we re-download a small overlap instead of
+    // leaving a gap of zeros.  Re-writing the same bytes is idempotent.
+    const RESUME_MARGIN: u64 = 2 * 1024 * 1024;
+
     let mut chunks = VecDeque::new();
     for c in snapshot.chunks {
-        // Reconstruct each chunk with its previously saved progress
-        chunks.push_back(Arc::new(Chunk::new(c.start..=c.end, c.progress)));
+        let safe_progress = c.progress.saturating_sub(RESUME_MARGIN);
+        chunks.push_back(Arc::new(Chunk::new(c.start..=c.end, safe_progress)));
     }
 
     Ok(Metadata {
@@ -122,10 +129,9 @@ async fn create_snapshot_sync(metadata: &Metadata) -> MetadataSnapshot {
     {
         let chunks_guard: MutexGuard<VecDeque<Arc<Chunk>>> = metadata.chunks.lock().await;
         for chunk_arc in chunks_guard.iter() {
-            let limits = chunk_arc.chunk_limits.lock().await;
             chunks.push(ChunkSnapshot {
-                start: *limits.start(),
-                end: *limits.end(),
+                start: chunk_arc.start,
+                end: chunk_arc.end.load(Ordering::Relaxed),
                 progress: chunk_arc.progress.load(Ordering::Relaxed),
             });
         }
@@ -135,10 +141,9 @@ async fn create_snapshot_sync(metadata: &Metadata) -> MetadataSnapshot {
     {
         let active_guard: MutexGuard<Vec<Arc<Chunk>>> = metadata.active_chunks.lock().await;
         for chunk_arc in active_guard.iter() {
-            let limits = chunk_arc.chunk_limits.lock().await;
             chunks.push(ChunkSnapshot {
-                start: *limits.start(),
-                end: *limits.end(),
+                start: chunk_arc.start,
+                end: chunk_arc.end.load(Ordering::Relaxed),
                 progress: chunk_arc.progress.load(Ordering::Relaxed),
             });
         }
@@ -148,10 +153,9 @@ async fn create_snapshot_sync(metadata: &Metadata) -> MetadataSnapshot {
     {
         let completed_guard: MutexGuard<Vec<Arc<Chunk>>> = metadata.completed_chunks.lock().await;
         for chunk_arc in completed_guard.iter() {
-            let limits = chunk_arc.chunk_limits.lock().await;
             chunks.push(ChunkSnapshot {
-                start: *limits.start(),
-                end: *limits.end(),
+                start: chunk_arc.start,
+                end: chunk_arc.end.load(Ordering::Relaxed),
                 progress: chunk_arc.progress.load(Ordering::Relaxed),
             });
         }
@@ -196,11 +200,12 @@ mod tests {
 
         let chunks: MutexGuard<VecDeque<Arc<Chunk>>> = loaded_metadata.chunks.lock().await;
         assert_eq!(chunks.len(), 1, "Should have loaded exactly one chunk");
-        assert_eq!(chunks[0].progress.load(Ordering::SeqCst), 500, "Loaded progress should match saved progress");
+        // Progress was adjusted by RESUME_MARGIN (2 MB) to guard against
+        // unflushed BufWriter data — the small test value gets zeroed.
+        assert_eq!(chunks[0].progress.load(Ordering::SeqCst), 0, "Progress regressed by resume margin");
 
-        let limits = chunks[0].chunk_limits.lock().await;
-        assert_eq!(*limits.start(), 0);
-        assert_eq!(*limits.end(), 999);
+        assert_eq!(chunks[0].start, 0);
+        assert_eq!(chunks[0].end.load(Ordering::Relaxed), 999);
     }
 
     #[tokio::test]
@@ -212,5 +217,128 @@ mod tests {
         assert_eq!(snapshot.chunks.len(), 1);
         assert_eq!(snapshot.chunks[0].start, 0);
         assert_eq!(snapshot.chunks[0].end, 999);
+    }
+
+    #[tokio::test]
+    async fn test_resume_margin_preserves_large_progress() {
+        // When saved progress exceeds RESUME_MARGIN the margin should only
+        // pull it back by 2 MB, not zero it out.
+        let dir = tempdir().unwrap();
+        let warp_path = dir.path().join("test.warp");
+        let large_progress = 50 * 1024 * 1024; // 50 MB
+
+        let metadata = Metadata::new("http://test.com".to_string(), 200 * 1024 * 1024, None, 1);
+        {
+            let chunks = metadata.chunks.lock().await;
+            chunks[0].progress.store(large_progress, Ordering::SeqCst);
+        }
+        save_snapshot_sync(&metadata, &warp_path).await.unwrap();
+
+        let loaded = load_snapshot(&warp_path).await.unwrap();
+        let chunks = loaded.chunks.lock().await;
+
+        // 50 MB - 2 MB margin = 48 MB
+        let expected = large_progress - 2 * 1024 * 1024;
+        assert_eq!(chunks[0].progress.load(Ordering::SeqCst), expected,
+                   "Large progress should only be reduced by RESUME_MARGIN");
+        assert_eq!(chunks[0].start, 0);
+        assert_eq!(chunks[0].end.load(Ordering::Relaxed), 200 * 1024 * 1024 - 1);
+    }
+
+    #[tokio::test]
+    async fn test_resume_margin_with_multiple_chunks() {
+        // Each chunk in a multi-chunk download should independently have the
+        // RESUME_MARGIN applied.
+        let dir = tempdir().unwrap();
+        let warp_path = dir.path().join("multi.warp");
+
+        // Create metadata with 4 initial chunks (simulating a pre-split download).
+        // Each chunk is 25 MB.  RESUME_MARGIN (2 MB) is subtracted independently.
+        let metadata = Metadata::new("http://test.com".to_string(), 100 * 1024 * 1024, None, 4);
+        {
+            let chunks = metadata.chunks.lock().await;
+            assert_eq!(chunks.len(), 4);
+            chunks[0].progress.store(5 * 1024 * 1024, Ordering::SeqCst);  // 5 - 2 = 3 MB
+            chunks[1].progress.store(10 * 1024 * 1024, Ordering::SeqCst); // 10 - 2 = 8 MB
+            chunks[2].progress.store(3 * 1024 * 1024, Ordering::SeqCst);  // 3 - 2 = 1 MB
+            chunks[3].progress.store(0, Ordering::SeqCst);                // 0 - 2 → 0 (saturating)
+        }
+        save_snapshot_sync(&metadata, &warp_path).await.unwrap();
+
+        let loaded = load_snapshot(&warp_path).await.unwrap();
+        let chunks = loaded.chunks.lock().await;
+        assert_eq!(chunks.len(), 4);
+
+        let mb = |n: u64| n * 1024 * 1024;
+        // Chunk 0: 5 MB - 2 MB = 3 MB
+        assert_eq!(chunks[0].progress.load(Ordering::SeqCst), mb(3));
+        // Chunk 1: 10 MB - 2 MB = 8 MB
+        assert_eq!(chunks[1].progress.load(Ordering::SeqCst), mb(8));
+        // Chunk 2: 3 MB - 2 MB = 1 MB
+        assert_eq!(chunks[2].progress.load(Ordering::SeqCst), mb(1));
+        // Chunk 3: 0 → 0 (saturating)
+        assert_eq!(chunks[3].progress.load(Ordering::SeqCst), 0);
+
+        // Ranges must be preserved exactly.
+        let total_size_4 = (100 * 1024 * 1024) / 4;
+        assert_eq!(chunks[0].start, 0);
+        assert_eq!(chunks[1].start, total_size_4);
+        assert_eq!(chunks[2].start, 2 * total_size_4);
+        assert_eq!(chunks[3].start, 3 * total_size_4);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_with_mixed_chunk_states() {
+        // Snapshot must correctly capture chunks across waiting, active, and
+        // completed lists — not just the waiting queue.
+        let dir = tempdir().unwrap();
+        let warp_path = dir.path().join("mixed.warp");
+
+        let metadata = Metadata::new("url".to_string(), 3000, None, 3);
+
+        // 1. Move middle chunk to active with partial progress.
+        // 2. Move last chunk to completed with full progress.
+        {
+            let mut queue = metadata.chunks.lock().await;
+            assert_eq!(queue.len(), 3);
+
+            // Pop the last two chunks.
+            let _c1 = queue.pop_back(); // chunk index 2 (range 2000..=2999)
+            let c2 = queue.pop_back().unwrap(); // chunk index 1 (range 1000..=1999)
+
+            // c2 goes to active with partial progress.
+            c2.progress.store(500, Ordering::SeqCst);
+            metadata.active_chunks.lock().await.push(c2);
+
+            // chunk index 2 goes to completed.
+            let c3 = Chunk::new(2000..=2999, 1000);
+            metadata.completed_chunks.lock().await.push(Arc::new(c3));
+        }
+
+        save_snapshot_sync(&metadata, &warp_path).await.unwrap();
+
+        // Load back — all three chunks must be reconstructed in the waiting queue.
+        let loaded = load_snapshot(&warp_path).await.unwrap();
+        let chunks = loaded.chunks.lock().await;
+        assert_eq!(chunks.len(), 3, "All chunks must be restored to waiting queue");
+
+        // Verify each chunk: range + (margin-adjusted) progress.
+        assert_eq!(chunks[0].start, 0);
+        assert_eq!(chunks[0].end.load(Ordering::Relaxed), 999);
+        assert_eq!(chunks[0].progress.load(Ordering::SeqCst), 0);
+
+        assert_eq!(chunks[1].start, 1000);
+        assert_eq!(chunks[1].end.load(Ordering::Relaxed), 1999);
+        // progress was 500, but < 2MB margin → zeroed
+        assert_eq!(chunks[1].progress.load(Ordering::SeqCst), 0);
+
+        assert_eq!(chunks[2].start, 2000);
+        assert_eq!(chunks[2].end.load(Ordering::Relaxed), 2999);
+        // progress was 1000, but < 2MB margin → zeroed
+        assert_eq!(chunks[2].progress.load(Ordering::SeqCst), 0);
+
+        // Total size preserved.
+        assert_eq!(loaded.size, 3000);
+        assert_eq!(loaded.url, "url");
     }
 }
